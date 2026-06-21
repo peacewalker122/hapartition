@@ -7,10 +7,9 @@ import (
 	"net"
 	"strings"
 	"sync"
-	"time"
 
+	"github.com/peacewalker122/hapartition/internal/gossip"
 	"github.com/peacewalker122/hapartition/internal/hashring"
-	"github.com/peacewalker122/hapartition/internal/membership"
 	"github.com/peacewalker122/hapartition/pkg/api"
 	"github.com/peacewalker122/hapartition/pkg/store"
 )
@@ -18,32 +17,38 @@ import (
 // Server is a Redis-compatible TCP server with cluster membership tracking
 // and consistent hash ring routing.
 type Server struct {
-	addr       string
-	store      *store.Store
-	membership *membership.Membership
-	ring       hashring.Hashring
-	ln         net.Listener
-	wg         sync.WaitGroup
-	quit       chan struct{}
-	done       chan struct{}
+	addr   string
+	localID string             // node ID (fallback when gossip is nil)
+	store  *store.Store
+	gossip *gossip.Handler
+	ring   hashring.Hashring
+	ln     net.Listener
+	wg     sync.WaitGroup
+	quit   chan struct{}
+	done   chan struct{}
 }
 
-// New creates a new Server with the given address and local node ID.
+// New creates a new Server with the given Redis bind address and node ID.
+// The gossip handler must be set via SetGossip before accepting connections.
 func New(addr, nodeID string) *Server {
 	ring := hashring.New(nodeID)
-	// Add the local node to the ring so the node's own keys are routable.
-	// The address is the local bind address; MOVED redirects for these keys
-	// will resolve to a different node, not back to self.
 	ring.AddNode(nodeID, addr, 256)
 
 	return &Server{
-		addr:       addr,
-		store:      store.New(),
-		membership: membership.New(nodeID),
-		ring:       ring,
-		quit:       make(chan struct{}),
-		done:       make(chan struct{}),
+		addr:    addr,
+		localID: nodeID,
+		store:   store.New(),
+		ring:    ring,
+		gossip:  nil, // set via SetGossip
+		quit:    make(chan struct{}),
+		done:    make(chan struct{}),
 	}
+}
+
+// SetGossip sets the gossip handler on the server. Must be called before
+// ListenAndServe if gossip features (replication, NODE.LIST) are wanted.
+func (s *Server) SetGossip(g *gossip.Handler) {
+	s.gossip = g
 }
 
 // ListenAndServe starts the TCP listener and accept loop.
@@ -53,7 +58,7 @@ func (s *Server) ListenAndServe() error {
 		return fmt.Errorf("server: listen %s: %w", s.addr, err)
 	}
 	s.ln = ln
-	log.Printf("server: listening on %s [node: %s]", s.addr, s.membership.NodeID())
+	log.Printf("server: listening on %s [node: %s]", s.addr, s.nodeID())
 
 	go s.acceptLoop()
 	return nil
@@ -103,9 +108,18 @@ func (s *Server) Wait() {
 	<-s.done
 }
 
-// Membership returns the server's cluster membership tracker.
-func (s *Server) Membership() *membership.Membership {
-	return s.membership
+// nodeID returns the node's ID from the gossip layer, or the server's own
+// node ID if gossip hasn't been initialised.
+func (s *Server) nodeID() string {
+	if s.gossip != nil {
+		return s.gossip.NodeID()
+	}
+	return s.localID
+}
+
+// Store returns the server's key-value store.
+func (s *Server) Store() *store.Store {
+	return s.store
 }
 
 // Ring returns the server's consistent hash ring.
@@ -162,13 +176,16 @@ func (s *Server) dispatch(wr *resp.Writer, cmd string, args []resp.Value) {
 
 	case "SET":
 		s.handleKeyCommand(wr, args, func(key, value string) {
-			s.store.Set(key, value)
+			ver := s.store.Set(key, value)
+			if s.gossip != nil && ver > 0 {
+				s.gossip.Broadcast(key, value, ver)
+			}
 			wr.WriteValue(resp.OK)
 		})
 
 	case "GET":
 		s.handleKeyCommand(wr, args, func(key, _ string) {
-			val, ok := s.store.Get(key)
+			val, _, ok := s.store.Get(key)
 			if !ok {
 				wr.WriteValue(resp.NullBulkString())
 			} else {
@@ -194,6 +211,9 @@ func (s *Server) dispatch(wr *resp.Writer, cmd string, args []resp.Value) {
 		wr.WriteValue(resp.Integer(n))
 
 	case "NODE.JOIN":
+		// With memberlist, cluster membership is handled automatically via
+		// gossip discovery. NODE.JOIN is kept for backwards compatibility —
+		// it adds the node to the hashring for MOVED routing.
 		if len(args) < 2 {
 			wr.WriteValue(resp.Error("ERR wrong number of arguments for 'NODE.JOIN' command"))
 			return
@@ -208,55 +228,32 @@ func (s *Server) dispatch(wr *resp.Writer, cmd string, args []resp.Value) {
 			wr.WriteValue(resp.Error("ERR invalid address"))
 			return
 		}
-		s.membership.Join(nodeID, address)
 		s.ring.AddNode(nodeID, address, 256)
 		wr.WriteValue(resp.OK)
 
 	case "NODE.LIST":
-		peers := s.membership.Peers()
-		arr := make(resp.Array, len(peers))
-		for i, p := range peers {
-			arr[i] = resp.Array{
-				resp.NewBulkString(p.NodeID),
-				resp.NewBulkString(p.Address),
-				resp.NewBulkString(p.Status.String()),
-				resp.NewBulkString(p.LastSeen.Format(time.RFC3339Nano)),
-			}
+		if s.gossip == nil {
+			wr.WriteValue(resp.Error("ERR gossip not initialized"))
+			return
+		}
+		members := s.gossip.MembersInfo()
+		arr := make(resp.Array, 0, len(members))
+		for _, m := range members {
+			arr = append(arr, resp.Array{
+				resp.NewBulkString(m.Name),
+				resp.NewBulkString(m.RedisAddr),
+				resp.NewBulkString("healthy"),
+			})
 		}
 		wr.WriteValue(arr)
 
 	case "NODE.PING":
-		if len(args) < 1 {
-			wr.WriteValue(resp.Error("ERR wrong number of arguments for 'NODE.PING' command"))
-			return
-		}
-		nodeID, ok := getBulkString(args[0])
-		if !ok {
-			wr.WriteValue(resp.Error("ERR invalid node-id"))
-			return
-		}
-		if s.membership.Ping(nodeID) {
-			wr.WriteValue(resp.OK)
-		} else {
-			wr.WriteValue(resp.Error(fmt.Sprintf("ERR unknown node '%s'", nodeID)))
-		}
+		// Memberlist handles health checks automatically.
+		wr.WriteValue(resp.Error("ERR NODE.PING not supported — memberlist handles health checks"))
 
 	case "NODE.LEAVE":
-		if len(args) < 1 {
-			wr.WriteValue(resp.Error("ERR wrong number of arguments for 'NODE.LEAVE' command"))
-			return
-		}
-		nodeID, ok := getBulkString(args[0])
-		if !ok {
-			wr.WriteValue(resp.Error("ERR invalid node-id"))
-			return
-		}
-		if s.membership.Remove(nodeID) {
-			s.ring.RemoveNode(nodeID)
-			wr.WriteValue(resp.Integer(1))
-		} else {
-			wr.WriteValue(resp.Integer(0))
-		}
+		// Memberlist handles leave via graceful shutdown.
+		wr.WriteValue(resp.Error("ERR NODE.LEAVE not supported — use shutdown to leave the cluster"))
 
 	default:
 		wr.WriteValue(resp.Error(fmt.Sprintf("ERR unknown command '%s'", cmd)))
@@ -279,7 +276,7 @@ func (s *Server) handleKeyCommand(wr *resp.Writer, args []resp.Value, fn func(ke
 
 	// Check hashring for ownership
 	ownerNode, ownerAddr := s.ring.GetNode(key)
-	if ownerNode != "" && ownerNode != s.membership.NodeID() {
+	if ownerNode != "" && ownerNode != s.nodeID() {
 		// Key belongs to a different node — MOVED redirect
 		wr.WriteValue(resp.Error(fmt.Sprintf("MOVED %s", ownerAddr)))
 		return

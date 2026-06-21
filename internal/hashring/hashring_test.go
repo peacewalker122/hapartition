@@ -129,6 +129,59 @@ func TestAddNodeUpdate(t *testing.T) {
 	}
 }
 
+func TestGetReplicas(t *testing.T) {
+	r := New("node-local")
+	r.AddNode("node-a", "10.0.0.1:6379", 100)
+	r.AddNode("node-b", "10.0.0.2:6380", 100)
+	r.AddNode("node-c", "10.0.0.3:6379", 100)
+
+	replicas := r.GetReplicas("mykey", 2)
+	if len(replicas) != 2 {
+		t.Fatalf("expected 2 replicas, got %d", len(replicas))
+	}
+	if replicas[0].NodeID == "" || replicas[1].NodeID == "" {
+		t.Fatal("expected non-empty node IDs")
+	}
+	if replicas[0].NodeID == replicas[1].NodeID {
+		t.Fatal("expected two distinct replicas")
+	}
+}
+
+func TestGetReplicasMoreThanNodes(t *testing.T) {
+	r := New("node-local")
+	r.AddNode("node-a", "10.0.0.1:6379", 100)
+
+	replicas := r.GetReplicas("key", 5)
+	if len(replicas) != 1 {
+		t.Fatalf("expected 1 replica (only 1 node in ring), got %d", len(replicas))
+	}
+}
+
+func TestGetReplicasDeterministic(t *testing.T) {
+	r1 := New("node-local")
+	r1.AddNode("node-a", "10.0.0.1:6379", 50)
+	r1.AddNode("node-b", "10.0.0.2:6380", 50)
+	r1.AddNode("node-c", "10.0.0.3:6379", 50)
+
+	r2 := New("node-local")
+	r2.AddNode("node-a", "10.0.0.1:6379", 50)
+	r2.AddNode("node-b", "10.0.0.2:6380", 50)
+	r2.AddNode("node-c", "10.0.0.3:6379", 50)
+
+	for _, key := range []string{"k1", "k2", "hello", "world"} {
+		r1r := r1.GetReplicas(key, 2)
+		r2r := r2.GetReplicas(key, 2)
+		if len(r1r) != len(r2r) {
+			t.Fatalf("mismatched replica count for %q", key)
+		}
+		for i := range r1r {
+			if r1r[i].NodeID != r2r[i].NodeID {
+				t.Fatalf("mismatched replica %d for %q: %s vs %s", i, key, r1r[i].NodeID, r2r[i].NodeID)
+			}
+		}
+	}
+}
+
 func TestConcurrentAccess(t *testing.T) {
 	r := New("node-local")
 	r.AddNode("node-a", "10.0.0.1:6379", 50)

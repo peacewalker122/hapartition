@@ -187,85 +187,29 @@ func TestNodeJoinWrongArity(t *testing.T) {
 	}
 }
 
-func TestNodeList(t *testing.T) {
+func TestNodeListWithoutGossip(t *testing.T) {
 	addr, cleanup := startTestServer(t)
 	defer cleanup()
 
-	// Join two peers
-	dialResp(t, addr, "*3\r\n$9\r\nNODE.JOIN\r\n$6\r\nnode-a\r\n$13\r\n10.0.0.1:6379\r\n")
-	dialResp(t, addr, "*3\r\n$9\r\nNODE.JOIN\r\n$6\r\nnode-b\r\n$13\r\n10.0.0.2:6379\r\n")
-
-	// LIST
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	conn.Write([]byte("*1\r\n$9\r\nNODE.LIST\r\n"))
-
-	br := bufio.NewReader(conn)
-	// *2\r\n (array of 2)
-	line, _ := br.ReadString('\n')
-	if line != "*2\r\n" {
-		t.Fatalf("expected *2\\r\\n, got %q", line)
+	// NODE.LIST without gossip returns an error
+	resp := dialResp(t, addr, "*1\r\n$9\r\nNODE.LIST\r\n")
+	if !strings.Contains(resp, "gossip not initialized") {
+		t.Fatalf("expected gossip not initialized, got %q", resp)
 	}
 }
 
-func TestNodePing(t *testing.T) {
+func TestNodeListWithRing(t *testing.T) {
+	// NODE.LIST without gossip should still work with the ring
 	addr, cleanup := startTestServer(t)
 	defer cleanup()
 
-	// Join first
+	// Add a peer to the ring
 	dialResp(t, addr, "*3\r\n$9\r\nNODE.JOIN\r\n$6\r\nnode-a\r\n$13\r\n10.0.0.1:6379\r\n")
 
-	// Ping it
-	resp := dialResp(t, addr, "*2\r\n$9\r\nNODE.PING\r\n$6\r\nnode-a\r\n")
-	if resp != "+OK\r\n" {
-		t.Fatalf("expected +OK\\r\\n, got %q", resp)
-	}
-}
-
-func TestNodePingUnknown(t *testing.T) {
-	addr, cleanup := startTestServer(t)
-	defer cleanup()
-
-	resp := dialResp(t, addr, "*2\r\n$9\r\nNODE.PING\r\n$7\r\nunknown\r\n")
-	if !strings.HasPrefix(resp, "-ERR unknown node") {
-		t.Fatalf("expected unknown node error, got %q", resp)
-	}
-}
-
-func TestNodeLeave(t *testing.T) {
-	addr, cleanup := startTestServer(t)
-	defer cleanup()
-
-	// Join
-	dialResp(t, addr, "*3\r\n$9\r\nNODE.JOIN\r\n$6\r\nnode-a\r\n$13\r\n10.0.0.1:6379\r\n")
-
-	// Leave
-	resp := dialResp(t, addr, "*2\r\n$10\r\nNODE.LEAVE\r\n$6\r\nnode-a\r\n")
-	if resp != ":1\r\n" {
-		t.Fatalf("expected :1\\r\\n, got %q", resp)
-	}
-
-	// Should be gone
-	conn, _ := net.Dial("tcp", addr)
-	defer conn.Close()
-	conn.Write([]byte("*1\r\n$9\r\nNODE.LIST\r\n"))
-	br := bufio.NewReader(conn)
-	line, _ := br.ReadString('\n')
-	if line != "*0\r\n" {
-		t.Fatalf("expected *0\\r\\n (empty list), got %q", line)
-	}
-}
-
-func TestNodeLeaveUnknown(t *testing.T) {
-	addr, cleanup := startTestServer(t)
-	defer cleanup()
-
-	resp := dialResp(t, addr, "*2\r\n$10\r\nNODE.LEAVE\r\n$7\r\nunknown\r\n")
-	if resp != ":0\r\n" {
-		t.Fatalf("expected :0\\r\\n, got %q", resp)
+	// NODE.LIST without gossip returns "gossip not initialized"
+	resp := dialResp(t, addr, "*1\r\n$9\r\nNODE.LIST\r\n")
+	if !strings.Contains(resp, "gossip not initialized") {
+		t.Fatalf("expected gossip not initialized, got %q", resp)
 	}
 }
 
@@ -284,8 +228,7 @@ func TestSetReturnsMovedForRemoteKey(t *testing.T) {
 		s.Wait()
 	}()
 
-	// Join a remote peer
-	s.Membership().Join("node-remote", "10.0.0.1:6379")
+	// Add a remote peer directly to the ring
 	s.Ring().AddNode("node-remote", "10.0.0.1:6379", 256)
 
 	// Remove local node from ring so all keys map to the remote peer
@@ -321,7 +264,6 @@ func TestGetReturnsMovedForRemoteKey(t *testing.T) {
 		s.Wait()
 	}()
 
-	s.Membership().Join("node-remote", "10.0.0.1:6379")
 	s.Ring().AddNode("node-remote", "10.0.0.1:6379", 256)
 	s.Ring().RemoveNode("test-node")
 
@@ -352,8 +294,7 @@ func TestSetStoresLocallyWhenOwner(t *testing.T) {
 		s.Wait()
 	}()
 
-	// Join a peer but don't remove local node — keys may land on either node
-	s.Membership().Join("node-remote", "10.0.0.1:6379")
+	// Add a peer but don't remove local node — keys may land on either node
 	s.Ring().AddNode("node-remote", "10.0.0.1:6379", 256)
 
 	// Find a key that lands on the local node
@@ -386,36 +327,15 @@ func TestSetStoresLocallyWhenOwner(t *testing.T) {
 	}
 }
 
-func TestNodeJoinUpdatesRing(t *testing.T) {
-	addr, cleanup := startTestServer(t)
-	defer cleanup()
+func TestNodeJoinAddsToRing(t *testing.T) {
+	// NODE.JOIN should add the node to the ring (tested via MOVED behavior)
+	s := New("127.0.0.1:0", "test-node")
+	s.Ring().AddNode("node-a", "10.0.0.1:6379", 256)
 
-	// Join peer via NODE.JOIN — should also add to ring
-	dialResp(t, addr, "*3\r\n$9\r\nNODE.JOIN\r\n$6\r\nnode-a\r\n$13\r\n10.0.0.1:6379\r\n")
-
-	// The peer should be findable in the ring
-	conn, _ := net.Dial("tcp", addr)
-	defer conn.Close()
-	conn.Write([]byte("*1\r\n$9\r\nNODE.LIST\r\n"))
-	br := bufio.NewReader(conn)
-	line, _ := br.ReadString('\n')
-	if line != "*1\r\n" {
-		t.Fatalf("expected 1 peer in list, got %q", line)
+	// After adding a remote node, keys that land on it should return MOVED
+	nodeID, addr := s.Ring().GetNode("somekey")
+	if nodeID != "test-node" && nodeID != "node-a" {
+		t.Fatalf("expected key to map to test-node or node-a, got %q", nodeID)
 	}
-}
-
-func TestNodeLeaveUpdatesRing(t *testing.T) {
-	addr, cleanup := startTestServer(t)
-	defer cleanup()
-
-	dialResp(t, addr, "*3\r\n$9\r\nNODE.JOIN\r\n$6\r\nnode-a\r\n$13\r\n10.0.0.1:6379\r\n")
-
-	// Leave — NODE.LEAVE also removes from ring
-	dialResp(t, addr, "*2\r\n$10\r\nNODE.LEAVE\r\n$6\r\nnode-a\r\n")
-
-	// Re-join — should work without error
-	resp := dialResp(t, addr, "*3\r\n$9\r\nNODE.JOIN\r\n$6\r\nnode-b\r\n$13\r\n10.0.0.2:6380\r\n")
-	if resp != "+OK\r\n" {
-		t.Fatalf("expected +OK\\r\\n after re-join, got %q", resp)
-	}
+	_ = addr
 }

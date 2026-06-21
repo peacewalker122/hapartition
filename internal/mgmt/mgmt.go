@@ -7,48 +7,40 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"time"
 
-	"github.com/peacewalker122/hapartition/internal/membership"
+	"github.com/peacewalker122/hapartition/internal/gossip"
 )
 
 // Server is an HTTP management server for cluster node operations.
 type Server struct {
-	addr       string
-	membership *membership.Membership
-	srv        *http.Server
-	ln         net.Listener
+	addr   string
+	gossip *gossip.Handler
+	srv    *http.Server
+	ln     net.Listener
 }
 
 // joinRequest is the JSON body for POST /join.
 type joinRequest struct {
-	NodeID  string `json:"node_id"`
 	Address string `json:"address"`
-}
-
-// heartbeatRequest is the JSON body for POST /heartbeat.
-type heartbeatRequest struct {
-	NodeID string `json:"node_id"`
 }
 
 // infoResponse is the JSON body for GET /info.
 type infoResponse struct {
-	NodeID string     `json:"node_id"`
-	Peers  []peerInfo `json:"peers"`
+	NodeID  string       `json:"node_id"`
+	Members []memberInfo `json:"members"`
 }
 
-type peerInfo struct {
-	NodeID   string `json:"node_id"`
-	Address  string `json:"address"`
-	Status   string `json:"status"`
-	LastSeen string `json:"last_seen"`
+type memberInfo struct {
+	Name      string `json:"name"`
+	RedisAddr string `json:"redis_addr"`
+	GossipAddr string `json:"gossip_addr"`
 }
 
-// New creates an HTTP management server sharing the given membership state.
-func New(addr string, m *membership.Membership) *Server {
+// New creates an HTTP management server sharing the given gossip handler.
+func New(addr string, g *gossip.Handler) *Server {
 	return &Server{
-		addr:       addr,
-		membership: m,
+		addr:   addr,
+		gossip: g,
 	}
 }
 
@@ -56,7 +48,6 @@ func New(addr string, m *membership.Membership) *Server {
 func (s *Server) ListenAndServe() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/join", s.handleJoin)
-	mux.HandleFunc("/heartbeat", s.handleHeartbeat)
 	mux.HandleFunc("/info", s.handleInfo)
 
 	s.srv = &http.Server{
@@ -102,38 +93,14 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("bad request: %v", err), http.StatusBadRequest)
 		return
 	}
-	if req.NodeID == "" || req.Address == "" {
-		http.Error(w, "node_id and address are required", http.StatusBadRequest)
+	if req.Address == "" {
+		http.Error(w, "address is required", http.StatusBadRequest)
 		return
 	}
 
-	s.membership.Join(req.NodeID, req.Address)
+	log.Printf("mgmt: joining %s via gossip", req.Address)
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintln(w, "OK")
-}
-
-func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req heartbeatRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, fmt.Sprintf("bad request: %v", err), http.StatusBadRequest)
-		return
-	}
-	if req.NodeID == "" {
-		http.Error(w, "node_id is required", http.StatusBadRequest)
-		return
-	}
-
-	if s.membership.Ping(req.NodeID) {
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintln(w, "OK")
-	} else {
-		http.Error(w, fmt.Sprintf("unknown node '%s'", req.NodeID), http.StatusNotFound)
-	}
 }
 
 func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
@@ -142,20 +109,19 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	peers := s.membership.Peers()
-	peerInfos := make([]peerInfo, len(peers))
-	for i, p := range peers {
-		peerInfos[i] = peerInfo{
-			NodeID:   p.NodeID,
-			Address:  p.Address,
-			Status:   p.Status.String(),
-			LastSeen: p.LastSeen.Format(time.RFC3339Nano),
+	members := s.gossip.MembersInfo()
+	memberInfos := make([]memberInfo, len(members))
+	for i, m := range members {
+		memberInfos[i] = memberInfo{
+			Name:       m.Name,
+			RedisAddr:  m.RedisAddr,
+			GossipAddr: m.Addr,
 		}
 	}
 
 	resp := infoResponse{
-		NodeID: s.membership.NodeID(),
-		Peers:  peerInfos,
+		NodeID:  s.gossip.NodeID(),
+		Members: memberInfos,
 	}
 
 	w.Header().Set("Content-Type", "application/json")

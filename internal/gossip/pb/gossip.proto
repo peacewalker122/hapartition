@@ -1,0 +1,20 @@
+syntax = "proto3";
+package gossip;
+option go_package = "github.com/peacewalker122/hapartition/internal/gossip/pb";
+
+// Entry is a single versioned key-value pair.
+message Entry {
+  string key   = 1;
+  string value = 2;
+  int64  version = 3;
+}
+
+// EntryBatch is used for both broadcast messages and anti-entropy snapshots.
+message EntryBatch {
+  repeated Entry entries = 1;
+}
+
+// NodeMeta carries per-node metadata encoded in memberlist's Meta field.
+message NodeMeta {
+  string redis_addr = 1; // e.g. "10.0.0.1:6379"
+}

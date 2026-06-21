@@ -8,6 +8,12 @@ import (
 	"github.com/cespare/xxhash/v2"
 )
 
+// Replica holds the identity of a replica node.
+type Replica struct {
+	NodeID  string
+	Address string
+}
+
 // Hashring is the interface for consistent hash ring implementations.
 type Hashring interface {
 	// AddNode adds a physical node with the given number of virtual replicas.
@@ -17,6 +23,10 @@ type Hashring interface {
 	// GetNode returns the nodeID and address that owns the given key.
 	// Returns ("", "") when the ring is empty.
 	GetNode(key string) (nodeID, address string)
+	// GetReplicas returns the first count distinct physical nodes that are
+	// responsible for the given key. The first entry is the primary owner.
+	// Returns fewer than count if the ring has fewer nodes.
+	GetReplicas(key string, count int) []Replica
 	// Nodes returns all physical node IDs currently in the ring.
 	Nodes() []string
 }
@@ -119,6 +129,42 @@ func (r *consistentHashring) GetNode(key string) (nodeID, address string) {
 	}
 	e := r.entries[idx]
 	return e.nodeID, e.address
+}
+
+func (r *consistentHashring) GetReplicas(key string, count int) []Replica {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if len(r.entries) == 0 || count <= 0 {
+		return nil
+	}
+
+	h := hashKey(key)
+	idx := sort.Search(len(r.entries), func(i int) bool {
+		return r.entries[i].hash >= h
+	})
+	if idx == len(r.entries) {
+		idx = 0
+	}
+
+	seen := make(map[string]bool, count)
+	replicas := make([]Replica, 0, count)
+
+	// Walk the ring clockwise from the key's position, collecting distinct
+	// physical nodes until we have enough or hit the full ring.
+	for i := 0; i < len(r.entries); i++ {
+		e := r.entries[(idx+i)%len(r.entries)]
+		if seen[e.nodeID] {
+			continue
+		}
+		seen[e.nodeID] = true
+		replicas = append(replicas, Replica{NodeID: e.nodeID, Address: e.address})
+		if len(replicas) >= count {
+			break
+		}
+	}
+
+	return replicas
 }
 
 func (r *consistentHashring) Nodes() []string {

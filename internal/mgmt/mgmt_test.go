@@ -10,69 +10,49 @@ import (
 	"testing"
 	"time"
 
-	"github.com/peacewalker122/hapartition/internal/membership"
+	"github.com/peacewalker122/hapartition/internal/gossip"
+	"github.com/peacewalker122/hapartition/internal/hashring"
+	"github.com/peacewalker122/hapartition/pkg/store"
 )
 
-func startTestMgmt(t *testing.T) (addr string, m *membership.Membership, cleanup func()) {
+// startTestMgmt creates a mgmt server with a minimal gossip handler for testing.
+func startTestMgmt(t *testing.T) (baseURL string, cleanup func()) {
 	t.Helper()
-	m = membership.New("test-node")
-	s := New("127.0.0.1:0", m)
 
-	// We need the actual bound address. Start with :0 to get a free port.
+	st := store.New()
+	ring := hashring.New("test-node")
+	ring.AddNode("test-node", "127.0.0.1:6379", 256)
+
+	cfg := gossip.Config{
+		NodeID:         "test-node",
+		BindAddr:       "127.0.0.1",
+		BindPort:       0, // random port
+		RedisAddr:      "127.0.0.1:6379",
+		Store:          st,
+		Ring:           ring,
+		ReplicaRF:      2,
+		AntiEntropySec: 0, // disable anti-entropy in tests
+	}
+	g := gossip.New(cfg)
+	if err := g.Start(); err != nil {
+		t.Fatalf("gossip start: %v", err)
+	}
+
+	s := New("127.0.0.1:0", g)
 	err := s.ListenAndServe()
 	if err != nil {
 		t.Fatalf("mgmt listen: %v", err)
 	}
-	// The ListenAndServe binds to :0 and logs the address, but we don't
-	// have access to the listener directly. Let me bind to a specific port.
-	// Actually, we need to refactor to expose the address.
-	// For now, let's use a fixed port or expose the addr.
-	_ = s
-
-	// Hmm, we don't have Addr() on mgmt.Server. Let me try a different approach.
-	// Actually, let me just test via the ListenAndServe by hardcoding a port? No.
-	// Let me close and restart with a different approach.
-	s.Shutdown(context.Background())
-
-	// Retry with :0 and use net.Listener to get port
-	s2 := New("127.0.0.1:0", m)
-	err = s2.ListenAndServe()
-	if err != nil {
-		t.Fatalf("mgmt listen: %v", err)
-	}
-
-	// Find the port from the listener... but we don't store it.
-	// Let me add Addr() to mgmt.Server. For now a workaround.
-	// Actually this is getting complicated. Let me just add an Addr method.
-	cleanup = func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		s2.Shutdown(ctx)
-	}
-	return "", m, cleanup
-}
-
-// Re-using the approach with a workaround: add Addr() to Server
-func startMgmtServer(t *testing.T, m *membership.Membership) (baseURL string, cleanup func()) {
-	t.Helper()
-	s := New("127.0.0.1:0", m)
-	err := s.ListenAndServe()
-	if err != nil {
-		t.Fatalf("mgmt listen: %v", err)
-	}
-	// Get the bound address via Addr()
-	addr := s.Addr()
 
 	cleanup = func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 		s.Shutdown(ctx)
+		g.Leave(time.Second)
 	}
-	return fmt.Sprintf("http://%s", addr), cleanup
-}
 
-// We need Addr() method on Server. Let me add it.
-// Actually, I already wrote mgmt.go without Addr(). Let me add it.
+	return fmt.Sprintf("http://%s", s.Addr()), cleanup
+}
 
 func httpPost(t *testing.T, url, body string) *http.Response {
 	t.Helper()
@@ -103,66 +83,32 @@ func readBody(t *testing.T, resp *http.Response) string {
 }
 
 func TestJoinEndpoint(t *testing.T) {
-	m := membership.New("test-node")
-	baseURL, cleanup := startMgmtServer(t, m)
+	baseURL, cleanup := startTestMgmt(t)
 	defer cleanup()
 
-	resp := httpPost(t, baseURL+"/join", `{"node_id":"node-a","address":"10.0.0.1:6379"}`)
+	resp := httpPost(t, baseURL+"/join", `{"address":"10.0.0.1:7946"}`)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, readBody(t, resp))
-	}
-
-	p, ok := m.Get("node-a")
-	if !ok {
-		t.Fatal("expected node-a to exist")
-	}
-	if p.Address != "10.0.0.1:6379" {
-		t.Fatalf("expected address 10.0.0.1:6379, got %s", p.Address)
 	}
 }
 
 func TestJoinBadRequest(t *testing.T) {
-	m := membership.New("test-node")
-	baseURL, cleanup := startMgmtServer(t, m)
+	baseURL, cleanup := startTestMgmt(t)
 	defer cleanup()
 
-	// Missing fields
-	resp := httpPost(t, baseURL+"/join", `{"node_id":""}`)
+	resp := httpPost(t, baseURL+"/join", `{"address":""}`)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", resp.StatusCode)
 	}
 }
 
-func TestHeartbeatEndpoint(t *testing.T) {
-	m := membership.New("test-node")
-	m.Join("node-a", "10.0.0.1:6379")
-
-	baseURL, cleanup := startMgmtServer(t, m)
-	defer cleanup()
-
-	resp := httpPost(t, baseURL+"/heartbeat", `{"node_id":"node-a"}`)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, readBody(t, resp))
-	}
-
-	// Unknown node
-	resp = httpPost(t, baseURL+"/heartbeat", `{"node_id":"unknown"}`)
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("expected 404, got %d", resp.StatusCode)
-	}
-}
-
 func TestInfoEndpoint(t *testing.T) {
-	m := membership.New("test-node")
-	m.Join("node-a", "10.0.0.1:6379")
-	m.Join("node-b", "10.0.0.2:6380")
-
-	baseURL, cleanup := startMgmtServer(t, m)
+	baseURL, cleanup := startTestMgmt(t)
 	defer cleanup()
 
 	resp := httpGet(t, baseURL+"/info")
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200, got %d", resp.StatusCode)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, readBody(t, resp))
 	}
 
 	body := readBody(t, resp)
@@ -173,7 +119,32 @@ func TestInfoEndpoint(t *testing.T) {
 	if info.NodeID != "test-node" {
 		t.Fatalf("expected node_id test-node, got %s", info.NodeID)
 	}
-	if len(info.Peers) != 2 {
-		t.Fatalf("expected 2 peers, got %d", len(info.Peers))
+}
+
+func TestInfoEndpointMethodCheck(t *testing.T) {
+	baseURL, cleanup := startTestMgmt(t)
+	defer cleanup()
+
+	resp, err := http.Post(baseURL+"/info", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /info: %v", err)
 	}
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+func TestJoinMethodCheck(t *testing.T) {
+	baseURL, cleanup := startTestMgmt(t)
+	defer cleanup()
+
+	resp, err := http.Get(baseURL + "/join")
+	if err != nil {
+		t.Fatalf("GET /join: %v", err)
+	}
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
 }
