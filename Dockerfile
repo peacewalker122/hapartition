@@ -1,13 +1,18 @@
 # syntax=docker/dockerfile:1
 FROM golang:1.26-alpine AS builder
 
-RUN apk add --no-cache git
+RUN apk add --no-cache git ca-certificates
 
 WORKDIR /src
+
+# Cache dependencies first
 COPY go.mod go.sum ./
 RUN go mod download
 
-COPY . .
+# Copy source and build
+COPY cmd/    ./cmd/
+COPY internal/ ./internal/
+COPY pkg/   ./pkg/
 
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /hapartition ./cmd/hapartition/
 
