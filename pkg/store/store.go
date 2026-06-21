@@ -17,9 +17,9 @@ type Entry struct {
 // (LWW) semantics: if the stored version is >= the incoming version, the
 // write is silently skipped. This enables read repair at the cluster level
 type Store struct {
-	mu     sync.RWMutex
-	data   map[string]Entry
-	clock  int64 // global monotonic version counter
+	mu    sync.RWMutex
+	data  map[string]Entry
+	clock int64 // global monotonic version counter
 }
 
 // New creates a new empty Store.

@@ -31,8 +31,8 @@ type infoResponse struct {
 }
 
 type memberInfo struct {
-	Name      string `json:"name"`
-	RedisAddr string `json:"redis_addr"`
+	Name       string `json:"name"`
+	RedisAddr  string `json:"redis_addr"`
 	GossipAddr string `json:"gossip_addr"`
 }
 

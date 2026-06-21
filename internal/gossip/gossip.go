@@ -8,8 +8,8 @@ import (
 	"github.com/hashicorp/memberlist"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/peacewalker122/hapartition/internal/hashring"
 	"github.com/peacewalker122/hapartition/internal/gossip/pb"
+	"github.com/peacewalker122/hapartition/internal/hashring"
 	"github.com/peacewalker122/hapartition/pkg/store"
 )
 
@@ -21,34 +21,34 @@ type Discoverer interface {
 
 // Config for the gossip layer.
 type Config struct {
-	NodeID         string         // unique node ID (memberlist Name)
-	BindAddr       string         // gossip bind address (e.g. "0.0.0.0")
-	BindPort       int            // gossip bind port
-	AdvertiseAddr  string         // optional, for NAT
-	RedisAddr      string         // Redis TCP address, stored in node Meta
-	Store          *store.Store   // shared store reference
+	NodeID         string            // unique node ID (memberlist Name)
+	BindAddr       string            // gossip bind address (e.g. "0.0.0.0")
+	BindPort       int               // gossip bind port
+	AdvertiseAddr  string            // optional, for NAT
+	RedisAddr      string            // Redis TCP address, stored in node Meta
+	Store          *store.Store      // shared store reference
 	Ring           hashring.Hashring // shared hashring reference
-	ReplicaRF      int            // replication factor (number of replicas per key)
-	Discoverer     Discoverer     // seed discovery
-	AntiEntropySec int            // anti-entropy interval in seconds (default 30)
+	ReplicaRF      int               // replication factor (number of replicas per key)
+	Discoverer     Discoverer        // seed discovery
+	AntiEntropySec int               // anti-entropy interval in seconds (default 30)
 }
 
 // Handler wraps memberlist and implements the Delegate + EventDelegate for
 // data replication via gossip.
 type Handler struct {
-	cfg         Config
-	memberlist  *memberlist.Memberlist
-	delegate    *gossipDelegate
-	broadcasts  *memberlist.TransmitLimitedQueue
-	stopCh      chan struct{}
+	cfg        Config
+	memberlist *memberlist.Memberlist
+	delegate   *gossipDelegate
+	broadcasts *memberlist.TransmitLimitedQueue
+	stopCh     chan struct{}
 }
 
 // New creates a gossip handler. Call Start() to begin.
 func New(cfg Config) *Handler {
 	return &Handler{
-		cfg: cfg,
+		cfg:      cfg,
 		delegate: &gossipDelegate{},
-		stopCh: make(chan struct{}),
+		stopCh:   make(chan struct{}),
 	}
 }
 
@@ -80,7 +80,7 @@ func (h *Handler) Start() error {
 
 	// Broadcast queue
 	h.broadcasts = &memberlist.TransmitLimitedQueue{
-		NumNodes: func() int { return list.NumMembers() },
+		NumNodes:       func() int { return list.NumMembers() },
 		RetransmitMult: 3,
 	}
 

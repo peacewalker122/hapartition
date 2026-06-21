@@ -17,15 +17,15 @@ import (
 // Server is a Redis-compatible TCP server with cluster membership tracking
 // and consistent hash ring routing.
 type Server struct {
-	addr   string
-	localID string             // node ID (fallback when gossip is nil)
-	store  *store.Store
-	gossip *gossip.Handler
-	ring   hashring.Hashring
-	ln     net.Listener
-	wg     sync.WaitGroup
-	quit   chan struct{}
-	done   chan struct{}
+	addr    string
+	localID string // node ID (fallback when gossip is nil)
+	store   *store.Store
+	gossip  *gossip.Handler
+	ring    hashring.Hashring
+	ln      net.Listener
+	wg      sync.WaitGroup
+	quit    chan struct{}
+	done    chan struct{}
 }
 
 // New creates a new Server with the given Redis bind address and node ID.
