@@ -3,6 +3,7 @@ package gossip
 import (
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/memberlist"
@@ -17,6 +18,58 @@ import (
 type Discoverer interface {
 	// Discover returns gossip addresses (host:port) to join.
 	Discover() ([]string, error)
+}
+
+const eventRingSize = 200
+
+// ClusterEvent is a cluster membership change recorded in the event log.
+type ClusterEvent struct {
+	Timestamp time.Time `json:"timestamp"`
+	Type      string    `json:"type"`      // join, leave, update
+	NodeName  string    `json:"node_name"`
+	Address   string    `json:"address"`
+	RedisAddr string    `json:"redis_addr"`
+	Meta      string    `json:"meta,omitempty"`
+}
+
+// eventRing is a fixed-size circular buffer of cluster events.
+type eventRing struct {
+	mu    sync.RWMutex
+	buf   []ClusterEvent
+	pos   int
+	count int
+}
+
+func newEventRing(capacity int) *eventRing {
+	return &eventRing{buf: make([]ClusterEvent, capacity)}
+}
+
+func (r *eventRing) Push(e ClusterEvent) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.buf[r.pos] = e
+	r.pos = (r.pos + 1) % len(r.buf)
+	if r.count < len(r.buf) {
+		r.count++
+	}
+}
+
+func (r *eventRing) Recent(n int) []ClusterEvent {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if n <= 0 || n > r.count {
+		n = r.count
+	}
+	out := make([]ClusterEvent, n)
+	start := r.pos - n
+	if start < 0 {
+		// wrapped
+		part := copy(out, r.buf[len(r.buf)+start:])
+		copy(out[part:], r.buf[:r.pos])
+	} else {
+		copy(out, r.buf[start:r.pos])
+	}
+	return out
 }
 
 // Config for the gossip layer.
@@ -41,14 +94,54 @@ type Handler struct {
 	delegate   *gossipDelegate
 	broadcasts *memberlist.TransmitLimitedQueue
 	stopCh     chan struct{}
+
+	events    *eventRing
+	subMu     sync.RWMutex
+	subNext   int
+	subscribers map[int]chan ClusterEvent
+}
+
+// PushEvent records an event in the ring buffer and fans it out to SSE subscribers.
+func (h *Handler) PushEvent(e ClusterEvent) {
+	h.events.Push(e)
+	h.subMu.RLock()
+	for _, ch := range h.subscribers {
+		select {
+		case ch <- e:
+		default:
+			// drop if subscriber is slow
+		}
+	}
+	h.subMu.RUnlock()
+}
+
+// Subscribe adds an SSE subscriber channel. Returns an unsubscribe func.
+func (h *Handler) Subscribe(ch chan ClusterEvent) func() {
+	h.subMu.Lock()
+	id := h.subNext
+	h.subNext++
+	h.subscribers[id] = ch
+	h.subMu.Unlock()
+	return func() {
+		h.subMu.Lock()
+		delete(h.subscribers, id)
+		h.subMu.Unlock()
+	}
+}
+
+// RecentEvents returns the last n cluster events.
+func (h *Handler) RecentEvents(n int) []ClusterEvent {
+	return h.events.Recent(n)
 }
 
 // New creates a gossip handler. Call Start() to begin.
 func New(cfg Config) *Handler {
 	return &Handler{
-		cfg:      cfg,
-		delegate: &gossipDelegate{},
-		stopCh:   make(chan struct{}),
+		cfg:         cfg,
+		delegate:    &gossipDelegate{},
+		stopCh:      make(chan struct{}),
+		events:      newEventRing(eventRingSize),
+		subscribers: make(map[int]chan ClusterEvent),
 	}
 }
 
@@ -319,18 +412,39 @@ func (d *gossipDelegate) NotifyJoin(node *memberlist.Node) {
 		redisAddr = node.Addr.String()
 	}
 	d.handler.cfg.Ring.AddNode(node.Name, redisAddr, 256)
+	d.handler.PushEvent(ClusterEvent{
+		Timestamp: time.Now(),
+		Type:      "join",
+		NodeName:  node.Name,
+		Address:   node.Addr.String(),
+		RedisAddr: redisAddr,
+	})
 	log.Printf("gossip: node joined: %s (%s)", node.Name, redisAddr)
 }
 
 // NotifyLeave is called when a node leaves the cluster.
 func (d *gossipDelegate) NotifyLeave(node *memberlist.Node) {
 	d.handler.cfg.Ring.RemoveNode(node.Name)
+	d.handler.PushEvent(ClusterEvent{
+		Timestamp: time.Now(),
+		Type:      "leave",
+		NodeName:  node.Name,
+		Address:   node.Addr.String(),
+		RedisAddr: DecodeMetaRedisAddr(node.Meta),
+	})
 	log.Printf("gossip: node left: %s", node.Name)
 }
 
 // NotifyUpdate is called when a node's metadata changes.
 func (d *gossipDelegate) NotifyUpdate(node *memberlist.Node) {
-	// No-op for now — metadata doesn't change after join.
+	redisAddr := DecodeMetaRedisAddr(node.Meta)
+	d.handler.PushEvent(ClusterEvent{
+		Timestamp: time.Now(),
+		Type:      "update",
+		NodeName:  node.Name,
+		Address:   node.Addr.String(),
+		RedisAddr: redisAddr,
+	})
 }
 
 // MemberInfo holds a summary of a cluster member for external consumers.
@@ -338,6 +452,17 @@ type MemberInfo struct {
 	Name      string
 	RedisAddr string
 	Addr      string
+	Status    string // alive, suspect, dead, left
+}
+
+// KeyCount returns the number of keys in the local store.
+func (h *Handler) KeyCount() int {
+	return h.cfg.Store.Len()
+}
+
+// Ring returns the shared hashring.
+func (h *Handler) Ring() hashring.Hashring {
+	return h.cfg.Ring
 }
 
 // MembersInfo returns all cluster members with their decoded Redis addresses.
@@ -348,10 +473,20 @@ func (h *Handler) MembersInfo() []MemberInfo {
 	members := h.memberlist.Members()
 	info := make([]MemberInfo, len(members))
 	for i, m := range members {
+		status := "alive"
+		switch m.State {
+		case memberlist.StateSuspect:
+			status = "suspect"
+		case memberlist.StateDead:
+			status = "dead"
+		case memberlist.StateLeft:
+			status = "left"
+		}
 		info[i] = MemberInfo{
 			Name:      m.Name,
 			Addr:      m.Addr.String(),
 			RedisAddr: DecodeMetaRedisAddr(m.Meta),
+			Status:    status,
 		}
 		if info[i].RedisAddr == "" {
 			info[i].RedisAddr = m.Addr.String()

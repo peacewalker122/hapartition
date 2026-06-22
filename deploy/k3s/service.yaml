@@ -1,0 +1,36 @@
+---
+# Headless service — each pod gets a DNS A/AAAA record so gossip peers can
+# discover each other by resolving the service name.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hapartition-gossip
+  namespace: hapartition
+  annotations:
+    service.alpha.kubernetes.io/tolerate-unready-endpoints: "true"
+spec:
+  clusterIP: None
+  selector:
+    app: hapartition
+  ports:
+    - port: 7946
+      name: gossip
+      protocol: TCP
+---
+# Client-facing service — Redis-compatible port + HTTP management.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hapartition
+  namespace: hapartition
+spec:
+  type: ClusterIP
+  selector:
+    app: hapartition
+  ports:
+    - port: 6379
+      name: redis
+      targetPort: redis
+    - port: 8080
+      name: http
+      targetPort: http

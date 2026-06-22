@@ -17,5 +17,8 @@ vendor/
 .DS_Store
 Thumbs.db
 
+# pi agent artifacts
+.pi/
+
 # Temp
 /tmp/

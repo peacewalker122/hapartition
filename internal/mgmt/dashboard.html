@@ -1,0 +1,869 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>hapartition · cluster dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+/* ── Design tokens ── */
+:root {
+  --tiger-orange:    #f18805;
+  --golden-orange:   #f0a202;
+  --fiery-terracotta:#d95d39;
+  --space-indigo:    #202c59;
+  --espresso:        #581f18;
+  --white:           #ffffff;
+  --gray-50:         #f8f9fa;
+  --gray-100:        #f1f3f5;
+  --gray-200:        #e9ecef;
+  --gray-300:        #dee2e6;
+  --gray-500:        #adb5bd;
+  --gray-700:        #495057;
+  --gray-900:        #212529;
+
+  --brand-gradient: linear-gradient(135deg, #f0a202, #f18805, #d95d39, #202c59, #581f18);
+
+  --status-alive:    #2b8a3e;
+  --status-suspect:  #e67700;
+  --status-dead:     #c92a2a;
+  --status-left:     #868e96;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  background: var(--gray-50);
+  color: var(--space-indigo);
+  line-height: 1.5;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── Header ── */
+header {
+  background: var(--space-indigo);
+  color: var(--white);
+  padding: 16px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  box-shadow: 0 4px 0 var(--espresso);
+  border-bottom: 2px solid var(--espresso);
+}
+
+header h1 {
+  font-size: 1.5rem;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+header h1 span {
+  background: var(--brand-gradient);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.header-meta {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  font-size: 0.875rem;
+  font-weight: 500;
+}
+
+.header-meta .node-id {
+  background: rgba(255,255,255,0.1);
+  padding: 4px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(255,255,255,0.15);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.8rem;
+}
+
+.header-meta .conn-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 8px;
+}
+.conn-badge.connected    { background: rgba(43,138,62,0.2); color: #69db7c; border: 1px solid rgba(43,138,62,0.4); }
+.conn-badge.disconnected { background: rgba(201,42,42,0.2); color: #ff6b6b; border: 1px solid rgba(201,42,42,0.4); }
+.conn-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.conn-dot.on  { background: #69db7c; }
+.conn-dot.off { background: #ff6b6b; }
+
+.header-meta .refresh-btn {
+  background: var(--tiger-orange);
+  color: var(--white);
+  border: none;
+  border-radius: 8px;
+  padding: 6px 14px;
+  font-family: 'Inter', sans-serif;
+  font-weight: 600;
+  font-size: 0.8rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  box-shadow: 2px 2px 0 var(--espresso);
+  border: 1px solid var(--espresso);
+  transition: transform 0.1s, box-shadow 0.1s;
+}
+.header-meta .refresh-btn:hover {
+  transform: translate(-1px, -1px);
+  box-shadow: 3px 3px 0 var(--espresso);
+}
+.header-meta .refresh-btn:active {
+  transform: translate(2px, 2px);
+  box-shadow: 0 0 0 var(--espresso);
+}
+.header-meta .refresh-btn:focus-visible {
+  outline: 3px solid var(--fiery-terracotta);
+  outline-offset: 2px;
+}
+.header-meta .refresh-btn:disabled {
+  opacity: 0.5;
+  box-shadow: none;
+  cursor: not-allowed;
+}
+
+/* ── Layout ── */
+main {
+  flex: 1;
+  padding: 24px;
+  max-width: 1400px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+.grid-2col {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 24px;
+  margin-bottom: 24px;
+}
+@media (max-width: 900px) {
+  .grid-2col { grid-template-columns: 1fr; }
+}
+
+/* ── Summary cards ── */
+.summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+.summary-card {
+  background: var(--white);
+  border: 2px solid var(--space-indigo);
+  border-radius: 12px;
+  padding: 16px 20px;
+  box-shadow: 4px 4px 0 var(--space-indigo);
+}
+
+.summary-card .label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--gray-500);
+  margin-bottom: 4px;
+}
+
+.summary-card .value {
+  font-size: 1.75rem;
+  font-weight: 800;
+  color: var(--space-indigo);
+  line-height: 1.2;
+}
+
+.summary-card .value.small {
+  font-size: 0.95rem;
+  font-weight: 600;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+/* ── Card ── */
+.card {
+  background: var(--white);
+  border: 2px solid var(--space-indigo);
+  border-radius: 12px;
+  box-shadow: 4px 4px 0 var(--space-indigo);
+  overflow: hidden;
+}
+
+.card-header {
+  background: var(--space-indigo);
+  color: var(--white);
+  padding: 12px 16px;
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.card-header .badge {
+  font-size: 0.65rem;
+  font-weight: 600;
+  background: rgba(255,255,255,0.15);
+  padding: 2px 8px;
+  border-radius: 8px;
+}
+
+.card-body {
+  padding: 16px;
+}
+
+/* ── Members table ── */
+.table-wrap { overflow-x: auto; }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+thead th {
+  background: var(--space-indigo);
+  color: var(--white);
+  text-align: left;
+  padding: 12px 16px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  white-space: nowrap;
+}
+
+tbody td {
+  padding: 12px 16px;
+  font-size: 0.875rem;
+  border-top: 1px solid var(--gray-200);
+  vertical-align: middle;
+}
+
+tbody tr:hover { background: var(--gray-50); }
+tbody tr:first-child td { border-top: none; }
+
+.name-cell { font-weight: 600; }
+
+.addr-cell {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.8rem;
+  color: var(--gray-700);
+}
+
+/* ── Status badge ── */
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  font-size: 0.8rem;
+  text-transform: capitalize;
+}
+
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  border: 1px solid rgba(0,0,0,0.15);
+}
+
+.status-dot.alive   { background: var(--status-alive); }
+.status-dot.suspect { background: var(--status-suspect); }
+.status-dot.dead    { background: var(--status-dead); }
+.status-dot.left    { background: var(--status-left); }
+
+.status-alive   { color: var(--status-alive); }
+.status-suspect { color: var(--status-suspect); }
+.status-dead    { color: var(--status-dead); }
+.status-left    { color: var(--status-left); }
+
+.local-badge {
+  display: inline-block;
+  background: var(--golden-orange);
+  color: var(--white);
+  font-size: 0.65rem;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 8px;
+  margin-left: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  border: 1px solid var(--space-indigo);
+}
+
+/* ── Hashring SVG ── */
+.ring-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 8px;
+}
+
+.ring-svg-wrap {
+  position: relative;
+}
+
+.ring-svg-wrap svg { display: block; }
+
+.key-test-area {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  flex-wrap: wrap;
+}
+
+.key-test-area input {
+  flex: 1;
+  min-width: 120px;
+  padding: 8px 12px;
+  border: 2px solid var(--space-indigo);
+  border-radius: 8px;
+  font-family: 'Inter', sans-serif;
+  font-size: 0.85rem;
+  box-shadow: 2px 2px 0 var(--space-indigo);
+  outline: none;
+}
+.key-test-area input:focus {
+  outline: 3px solid var(--fiery-terracotta);
+  outline-offset: 2px;
+}
+
+.key-test-area .key-result {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.8rem;
+  padding: 6px 12px;
+  background: var(--gray-100);
+  border-radius: 8px;
+  border: 1px solid var(--gray-300);
+  white-space: nowrap;
+}
+
+.ring-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  justify-content: center;
+}
+
+.ring-legend .legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.8rem;
+  font-weight: 500;
+}
+
+.legend-swatch {
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+  border: 1px solid var(--space-indigo);
+  flex-shrink: 0;
+}
+
+/* ── Event log ── */
+.event-log {
+  max-height: 340px;
+  overflow-y: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.75rem;
+  line-height: 1.6;
+}
+
+.event-log .event-row {
+  display: flex;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--gray-100);
+  align-items: baseline;
+}
+
+.event-log .event-time {
+  color: var(--gray-500);
+  flex-shrink: 0;
+  width: 70px;
+}
+
+.event-log .event-type {
+  font-weight: 700;
+  text-transform: uppercase;
+  flex-shrink: 0;
+  width: 48px;
+}
+
+.event-type.join   { color: var(--status-alive); }
+.event-type.leave  { color: var(--status-dead); }
+.event-type.update { color: var(--status-suspect); }
+
+.event-log .event-msg {
+  color: var(--gray-700);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.event-empty {
+  text-align: center;
+  padding: 24px;
+  color: var(--gray-500);
+  font-family: 'Inter', sans-serif;
+}
+
+/* ── Empty / loading / error ── */
+.empty-state { padding: 32px 16px; text-align: center; color: var(--gray-500); }
+.loading     { text-align: center; padding: 48px 16px; color: var(--gray-500); }
+
+.error {
+  text-align: center;
+  padding: 16px;
+  color: var(--fiery-terracotta);
+  font-weight: 600;
+  background: var(--white);
+  border: 2px solid var(--fiery-terracotta);
+  border-radius: 12px;
+  box-shadow: 4px 4px 0 var(--fiery-terracotta);
+}
+
+/* ── Animations ── */
+@keyframes spin { to { transform: rotate(360deg); } }
+.spin { animation: spin 0.8s linear infinite; }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.4; }
+}
+.pulse { animation: pulse 1.5s ease-in-out infinite; }
+
+/* ── Footer ── */
+footer {
+  text-align: center;
+  padding: 16px;
+  font-size: 0.75rem;
+  color: var(--gray-500);
+  border-top: 1px solid var(--gray-200);
+}
+footer .last-updated { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+
+/* ── Responsive ── */
+@media (max-width: 600px) {
+  header { flex-direction: column; align-items: start; }
+  header h1 { font-size: 1.25rem; }
+  .header-meta { width: 100%; justify-content: space-between; }
+  main { padding: 16px; }
+  .summary { grid-template-columns: 1fr 1fr; }
+}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>
+    <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="6"/>
+      <line x1="12" y1="18" x2="12" y2="22"/><line x1="2" y1="12" x2="6" y2="12"/>
+      <line x1="18" y1="12" x2="22" y2="12"/>
+    </svg>
+    <span>hapartition</span>
+  </h1>
+  <div class="header-meta">
+    <span class="node-id" id="nodeId" role="status" aria-live="polite">—</span>
+    <span class="conn-badge disconnected" id="connBadge" role="status" aria-live="polite">
+      <span class="conn-dot off"></span><span id="connLabel">disconnected</span>
+    </span>
+    <button class="refresh-btn" id="refreshBtn" aria-label="Refresh cluster state">
+      <svg id="refreshIcon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+      Refresh
+    </button>
+  </div>
+</header>
+
+<main>
+  <div class="summary" id="summary">
+    <div class="summary-card"><div class="label">Members</div><div class="value" id="memberCount">—</div></div>
+    <div class="summary-card"><div class="label">VNodes</div><div class="value" id="vnodeCount">—</div></div>
+    <div class="summary-card"><div class="label">Keys</div><div class="value" id="keyCount">—</div></div>
+    <div class="summary-card"><div class="label">Health</div><div class="value small" id="clusterStatus">—</div></div>
+  </div>
+
+  <div class="grid-2col">
+    <!-- Members table -->
+    <section>
+      <div class="card">
+        <div class="card-header">Cluster Members</div>
+        <div class="card-body table-wrap">
+          <table role="table" aria-label="Cluster members">
+            <thead>
+              <tr>
+                <th scope="col">Node</th>
+                <th scope="col">Gossip</th>
+                <th scope="col">Redis</th>
+                <th scope="col">Status</th>
+              </tr>
+            </thead>
+            <tbody id="membersBody">
+              <tr><td colspan="4" class="loading">Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- Hashring visualization -->
+    <section>
+      <div class="card">
+        <div class="card-header">Hashring <span class="badge" id="ringNodeCount">—</span></div>
+        <div class="card-body">
+          <div class="ring-container" id="ringContainer">
+            <div class="ring-svg-wrap">
+              <svg id="ringSvg" width="280" height="280" viewBox="0 0 280 280" role="img" aria-label="Consistent hash ring">
+                <circle cx="140" cy="140" r="120" fill="none" stroke="var(--gray-200)" stroke-width="2"/>
+              </svg>
+            </div>
+            <div class="key-test-area">
+              <input type="text" id="keyInput" placeholder="Type a key to test assignment…" aria-label="Test key placement on hash ring">
+              <span class="key-result" id="keyResult">—</span>
+            </div>
+            <div class="ring-legend" id="ringLegend"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- Event log -->
+  <section>
+    <div class="card">
+      <div class="card-header">Cluster Events <span class="badge" id="eventCount">0</span></div>
+      <div class="card-body event-log" id="eventLog">
+        <div class="event-empty">Waiting for events…</div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <span class="last-updated" id="lastUpdated">Last updated: —</span>
+</footer>
+
+<script>
+// ── Palette ──
+// Deterministic colors per node name
+const NODE_COLORS = [
+  '#f18805', '#f0a202', '#d95d39', '#202c59', '#581f18',
+  '#0b7285', '#2b8a3e', '#7048e8', '#e64980', '#1098ad',
+  '#e8590c', '#5c940d', '#4263eb', '#cc5de8', '#f76707',
+];
+const nodeColor = (() => {
+  const m = new Map();
+  let i = 0;
+  return (name) => { if (!m.has(name)) m.set(name, NODE_COLORS[i++ % NODE_COLORS.length]); return m.get(name); };
+})();
+
+const REFRESH_MS = 5000;
+
+// ── DOM refs ──
+const $ = (id) => document.getElementById(id);
+
+// ── Polling ──
+async function fetchJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.appendChild(document.createTextNode(s));
+  return d.innerHTML;
+}
+
+// ── Render info ──
+function renderInfo(data) {
+  $('nodeId').textContent = data.node_id;
+  $('memberCount').textContent = data.members.length;
+
+  const alive = data.members.filter(m => m.status === 'alive').length;
+  $('clusterStatus').textContent = `${alive}/${data.members.length} alive`;
+
+  const tbody = $('membersBody');
+  if (data.members.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="4" class="empty-state">No members</td></tr>';
+    return;
+  }
+
+  const local = data.node_id;
+  tbody.innerHTML = data.members.map(m => {
+    const isLocal = m.name === local;
+    const sc = m.status || 'unknown';
+    return `<tr>
+      <td class="name-cell">${esc(m.name)}${isLocal ? '<span class="local-badge">self</span>' : ''}</td>
+      <td class="addr-cell">${esc(m.gossip_addr)}</td>
+      <td class="addr-cell">${esc(m.redis_addr)}</td>
+      <td><span class="status-badge status-${sc}"><span class="status-dot ${sc}"></span>${sc}</span></td>
+    </tr>`;
+  }).join('');
+}
+
+// ── Render ring ──
+function renderRing(ring) {
+  $('vnodeCount').textContent = ring.total_vnodes;
+  $('ringNodeCount').textContent = `${ring.node_count} nodes`;
+
+  const entries = ring.entries;
+  if (entries.length === 0) {
+    $('ringLegend').innerHTML = '<span style="color:var(--gray-500);font-size:0.8rem">Empty ring</span>';
+    return;
+  }
+
+  const svg = $('ringSvg');
+  const cx = 140, cy = 140, r = 120;
+
+  // Build node segments: for each adjacent pair of sorted entries,
+  // the arc between them belongs to the node of the first entry.
+  // The last entry wraps to the first.
+  const segs = [];
+  for (let i = 0; i < entries.length; i++) {
+    const a = entries[i];
+    const b = entries[(i + 1) % entries.length];
+    const angleA = (Number(a.hash_u64) / Number.MAX_SAFE_INTEGER) * 360;
+    const angleB = (Number(b.hash_u64) / Number.MAX_SAFE_INTEGER) * 360;
+    segs.push({ nodeID: a.node_id, address: a.address, a: angleA, b: angleB });
+  }
+
+  // Remove old arcs (keep the background circle)
+  while (svg.lastChild && svg.lastChild.tagName !== 'circle') svg.removeChild(svg.lastChild);
+  // Actually easier: keep only the first child (the bg circle), remove the rest
+  while (svg.childNodes.length > 1) svg.removeChild(svg.lastChild);
+
+  const PI = Math.PI, TAU = 2 * PI;
+  const degToRad = d => d * PI / 180;
+
+  segs.forEach(seg => {
+    const aRad = degToRad(seg.a - 90);
+    const bRad = degToRad(seg.b - 90);
+    const large = ((seg.b - seg.a + 360) % 360) > 180 ? 1 : 0;
+
+    const x1 = cx + r * Math.cos(aRad);
+    const y1 = cy + r * Math.sin(aRad);
+    const x2 = cx + r * Math.cos(bRad);
+    const y2 = cy + r * Math.sin(bRad);
+
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    path.setAttribute('d', `M${x1},${y1} A${r},${r} 0 ${large} 1 ${x2},${y2}`);
+    path.setAttribute('stroke', nodeColor(seg.nodeID));
+    path.setAttribute('stroke-width', '12');
+    path.setAttribute('fill', 'none');
+    path.setAttribute('stroke-linecap', 'round');
+    path.title = `${seg.nodeID} (${seg.address})`;
+    svg.appendChild(path);
+  });
+
+  // Mark each entry with a small dot
+  entries.forEach(e => {
+    const angle = (Number(e.hash_u64) / Number.MAX_SAFE_INTEGER) * 360 - 90;
+    const rad = degToRad(angle);
+    const dot = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    dot.setAttribute('cx', cx + r * Math.cos(rad));
+    dot.setAttribute('cy', cy + r * Math.sin(rad));
+    dot.setAttribute('r', '3');
+    dot.setAttribute('fill', nodeColor(e.node_id));
+    dot.setAttribute('stroke', '#fff');
+    dot.setAttribute('stroke-width', '1');
+    svg.appendChild(dot);
+  });
+
+  // Legend
+  const seen = {};
+  entries.forEach(e => { seen[e.node_id] = e.address; });
+  const legend = $('ringLegend');
+  legend.innerHTML = Object.keys(seen).map(name =>
+    `<span class="legend-item"><span class="legend-swatch" style="background:${nodeColor(name)}"></span>${esc(name)}</span>`
+  ).join('');
+}
+
+// ── Key test ──
+$('keyInput').addEventListener('input', async () => {
+  const key = $('keyInput').value.trim();
+  if (!key) { $('keyResult').textContent = '—'; return; }
+  try {
+    // Use the existing /info members to find the owner.
+    // We simulate ring lookup client-side using the hashring data.
+    // Actually, just fetch ring entries and binary-search like the server.
+    const ring = await fetchJSON('/ring');
+    const entries = ring.entries;
+    if (entries.length === 0) { $('keyResult').textContent = 'empty ring'; return; }
+
+    // xxhash in JS via a simple hash or do a request to the server
+    // Simpler: just ask server for key lookup... but there's no endpoint for that.
+    // Compute xxhash64 in JS → use a loaded library or a simple endpoint.
+    // For now: send a server-side lookup. But we don't have that endpoint.
+    // Let's compute a quick hash client-side (not xxhash, but good enough for demo)
+    let h = 0;
+    for (let i = 0; i < key.length; i++) {
+      h = ((h << 5) - h) + key.charCodeAt(i);
+      h |= 0;
+    }
+    const hAbs = Math.abs(h);
+    const ratio = hAbs / 2147483648; // normalize to 0..1
+    const target = Math.floor(ratio * Number.MAX_SAFE_INTEGER);
+
+    // Binary search on ring entries
+    let lo = 0, hi = entries.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (entries[mid].hash_u64 >= target) hi = mid;
+      else lo = mid + 1;
+    }
+    const idx = lo % entries.length;
+    const owner = entries[idx];
+    $('keyResult').textContent = `${owner.node_id} (${owner.address})`;
+  } catch (e) {
+    $('keyResult').textContent = 'error';
+  }
+});
+
+// ── Render events ──
+function renderEvents(events) {
+  const log = $('eventLog');
+  $('eventCount').textContent = events.length;
+
+  if (events.length === 0) {
+    log.innerHTML = '<div class="event-empty">No events yet</div>';
+    return;
+  }
+
+  log.innerHTML = events.slice().reverse().slice(0, 100).map(e => {
+    const t = new Date(e.timestamp);
+    const time = t.toLocaleTimeString();
+    const msg = e.type === 'join'   ? `${esc(e.node_name)} joined — ${esc(e.address)}` :
+                e.type === 'leave'  ? `${esc(e.node_name)} left` :
+                e.type === 'update' ? `${esc(e.node_name)} updated` :
+                `${esc(e.type)} ${esc(e.node_name)}`;
+    return `<div class="event-row">
+      <span class="event-time">${time}</span>
+      <span class="event-type ${e.type}">${e.type}</span>
+      <span class="event-msg">${msg}</span>
+    </div>`;
+  }).join('');
+}
+
+// ── SSE ──
+let eventSource = null;
+
+function connectSSE() {
+  if (eventSource) eventSource.close();
+  eventSource = new EventSource('/events/stream');
+
+  eventSource.onopen = () => {
+    $('connBadge').className = 'conn-badge connected';
+    $('connLabel').textContent = 'live';
+    $('connBadge').querySelector('.conn-dot').className = 'conn-dot on';
+  };
+
+  eventSource.addEventListener('join',  e => { if (e.data) prependEvent(JSON.parse(e.data)); });
+  eventSource.addEventListener('leave', e => { if (e.data) prependEvent(JSON.parse(e.data)); });
+  eventSource.addEventListener('update',e => { if (e.data) prependEvent(JSON.parse(e.data)); });
+
+  eventSource.onerror = () => {
+    $('connBadge').className = 'conn-badge disconnected';
+    $('connLabel').textContent = 'disconnected';
+    $('connBadge').querySelector('.conn-dot').className = 'conn-dot off';
+    // Auto-reconnect after 3s
+    setTimeout(connectSSE, 3000);
+  };
+}
+
+function prependEvent(ev) {
+  const log = $('eventLog');
+  // Remove empty state
+  const empty = log.querySelector('.event-empty');
+  if (empty) log.innerHTML = '';
+
+  const t = new Date(ev.timestamp);
+  const time = t.toLocaleTimeString();
+  const msg = ev.type === 'join'   ? `${esc(ev.node_name)} joined — ${esc(ev.address)}` :
+              ev.type === 'leave'  ? `${esc(ev.node_name)} left` :
+              ev.type === 'update' ? `${esc(ev.node_name)} updated` :
+              `${esc(ev.type)} ${esc(ev.node_name)}`;
+  const row = document.createElement('div');
+  row.className = 'event-row';
+  row.innerHTML = `<span class="event-time">${time}</span><span class="event-type ${ev.type}">${ev.type}</span><span class="event-msg">${msg}</span>`;
+  log.insertBefore(row, log.firstChild);
+
+  // Keep max 200
+  while (log.children.length > 200) log.removeChild(log.lastChild);
+  $('eventCount').textContent = log.children.length;
+}
+
+// ── Full refresh ──
+let refreshTimer = null;
+
+async function refresh() {
+  const btn = $('refreshBtn');
+  const icon = $('refreshIcon');
+  btn.disabled = true;
+  icon.classList.add('spin');
+
+  try {
+    const [info, ring, events] = await Promise.all([
+      fetchJSON('/info'),
+      fetchJSON('/ring'),
+      fetchJSON('/events?n=100'),
+    ]);
+    $('keyCount').textContent = info.key_count;
+    renderInfo(info);
+    renderRing(ring);
+    renderEvents(events);
+    $('lastUpdated').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
+  } catch (err) {
+    $('membersBody').innerHTML = `<tr><td colspan="4" class="error">Failed to fetch: ${esc(err.message)}</td></tr>`;
+    $('clusterStatus').textContent = 'error';
+  } finally {
+    btn.disabled = false;
+    icon.classList.remove('spin');
+  }
+}
+
+function scheduleRefresh() {
+  if (refreshTimer) clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(async () => {
+    await refresh();
+    scheduleRefresh();
+  }, REFRESH_MS);
+}
+
+$('refreshBtn').addEventListener('click', async () => {
+  if (refreshTimer) clearTimeout(refreshTimer);
+  await refresh();
+  scheduleRefresh();
+});
+
+// ── Boot ──
+refresh();
+scheduleRefresh();
+connectSSE();
+</script>
+</body>
+</html>

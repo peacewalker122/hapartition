@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hapartition
+  namespace: hapartition
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hapartition
+  template:
+    metadata:
+      labels:
+        app: hapartition
+    spec:
+      containers:
+        - name: hapartition
+          image: ghcr.io/peacewalker122/hapartition:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - --port=6379
+            - --http=8080
+            - --gossip-port=7946
+            # Start alone.  When scaling beyond 1 replica, set --join to the
+            # headless service so pods discover each other via gossip, e.g.:
+            # - --join=hapartition-0.hapartition-gossip.hapartition.svc:7946
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - containerPort: 6379
+              name: redis
+              protocol: TCP
+            - containerPort: 8080
+              name: http
+              protocol: TCP
+            - containerPort: 7946
+              name: gossip
+              protocol: TCP
+          livenessProbe:
+            tcpSocket:
+              port: redis
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            tcpSocket:
+              port: redis
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              memory: 64Mi
+              cpu: 100m
+            limits:
+              memory: 128Mi
+              cpu: 500m
+      terminationGracePeriodSeconds: 30

@@ -77,6 +77,13 @@ func (s *Store) Snapshot() map[string]Entry {
 	return cp
 }
 
+// Len returns the number of keys in the store.
+func (s *Store) Len() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.data)
+}
+
 // Del removes one or more keys and returns the number of keys actually removed.
 func (s *Store) Del(keys ...string) int {
 	s.mu.Lock()

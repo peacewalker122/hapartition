@@ -14,6 +14,13 @@ type Replica struct {
 	Address string
 }
 
+// RingEntryInfo exposes a virtual ring node for the dashboard.
+type RingEntryInfo struct {
+	Hash    uint64 `json:"hash"`
+	NodeID  string `json:"node_id"`
+	Address string `json:"address"`
+}
+
 // Hashring is the interface for consistent hash ring implementations.
 type Hashring interface {
 	// AddNode adds a physical node with the given number of virtual replicas.
@@ -29,6 +36,9 @@ type Hashring interface {
 	GetReplicas(key string, count int) []Replica
 	// Nodes returns all physical node IDs currently in the ring.
 	Nodes() []string
+	// RingSnapshot returns every virtual entry on the ring, sorted by hash.
+	// Used by the dashboard to render the ring visualization.
+	RingSnapshot() []RingEntryInfo
 }
 
 // ringEntry is a single virtual node on the ring.
@@ -176,6 +186,16 @@ func (r *consistentHashring) Nodes() []string {
 	}
 	sort.Strings(result)
 	return result
+}
+
+func (r *consistentHashring) RingSnapshot() []RingEntryInfo {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]RingEntryInfo, len(r.entries))
+	for i, e := range r.entries {
+		out[i] = RingEntryInfo{Hash: e.hash, NodeID: e.nodeID, Address: e.address}
+	}
+	return out
 }
 
 // hashKey returns a 64-bit hash of the given key using xxHash.
