@@ -17,6 +17,7 @@ import (
 )
 
 func main() {
+	nodeID := flag.String("node-id", "", "Unique node ID (default: os.Hostname())")
 	redisPort := flag.String("port", "6379", "Redis-compatible TCP port")
 	httpPort := flag.String("http", "8080", "HTTP management port")
 	gossipPort := flag.Int("gossip-port", 7946, "Gossip (memberlist) port")
@@ -24,19 +25,23 @@ func main() {
 	replicaRF := flag.Int("rf", 2, "Replication factor")
 	flag.Parse()
 
-	hostname, err := os.Hostname()
-	if err != nil {
-		log.Fatalf("failed to get hostname: %v", err)
+	id := *nodeID
+	if id == "" {
+		var err error
+		id, err = os.Hostname()
+		if err != nil {
+			log.Fatalf("failed to get hostname: %v", err)
+		}
 	}
 
 	redisAddr := ":" + *redisPort
 
 	// Create the Redis-compatible TCP server
-	redisSrv := server.New(redisAddr, hostname)
+	redisSrv := server.New(redisAddr, id)
 
 	// Create gossip handler with memberlist
 	gossipCfg := gossip.Config{
-		NodeID:         hostname,
+		NodeID:         id,
 		BindAddr:       "0.0.0.0",
 		BindPort:       *gossipPort,
 		RedisAddr:      redisAddr,

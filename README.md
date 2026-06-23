@@ -84,18 +84,18 @@ curl -s http://localhost:8080/info | jq .
 
 ### Multi-node cluster
 
-Start three nodes (each in its own terminal or tmux pane):
+Start three nodes (each in its own terminal or tmux pane). **Important:** on the same machine, each node needs a unique `--node-id` — `os.Hostname()` is identical for all processes, which breaks memberlist and the hashring.
 
 ```bash
 # Terminal 1 — seed node
-./hapartition --port 6379 --http 8080 --gossip-port 7946
+./hapartition --node-id node-a --port 6379 --http 8080 --gossip-port 7946
 
 # Terminal 2 — joins node 1
-./hapartition --port 6380 --http 8081 --gossip-port 7947 \
+./hapartition --node-id node-b --port 6380 --http 8081 --gossip-port 7947 \
   --join 127.0.0.1:7946
 
 # Terminal 3 — joins node 1
-./hapartition --port 6381 --http 8082 --gossip-port 7948 \
+./hapartition --node-id node-c --port 6381 --http 8082 --gossip-port 7948 \
   --join 127.0.0.1:7946
 ```
 
@@ -113,6 +113,7 @@ redis-cli -p 6380 SET mykey value
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `--node-id` | `os.Hostname()` | Unique node ID (required when running multiple nodes on the same machine) |
 | `--port` | `6379` | Redis-compatible TCP port |
 | `--http` | `8080` | HTTP management port (GET /info, POST /join) |
 | `--gossip-port` | `7946` | Memberlist gossip port (TCP+UDP) |
