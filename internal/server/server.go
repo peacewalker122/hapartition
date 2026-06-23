@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -117,6 +118,15 @@ func (s *Server) nodeID() string {
 	return s.localID
 }
 
+// buildInfo returns a minimal INFO response for cluster tool compatibility.
+func (s *Server) buildInfo() string {
+	_, portStr, _ := net.SplitHostPort(s.Addr())
+	if portStr == "" {
+		portStr = "6379"
+	}
+	return fmt.Sprintf("# Server\r\nredis_version:7.2.0\r\nos:Linux\r\ntcp_port:%s\r\n\r\n# Cluster\r\ncluster_enabled:1\r\n", portStr)
+}
+
 // Store returns the server's key-value store.
 func (s *Server) Store() *store.Store {
 	return s.store
@@ -173,6 +183,10 @@ func (s *Server) dispatch(wr *resp.Writer, cmd string, args []resp.Value) {
 	switch cmd {
 	case "PING":
 		wr.WriteValue(resp.PONG)
+
+	case "INFO":
+		info := s.buildInfo()
+		wr.WriteValue(resp.NewBulkString(info))
 
 	case "SET":
 		s.handleKeyCommand(wr, args, func(key, value string) {
@@ -247,6 +261,9 @@ func (s *Server) dispatch(wr *resp.Writer, cmd string, args []resp.Value) {
 		}
 		wr.WriteValue(arr)
 
+	case "CLUSTER":
+		s.handleCluster(wr, args)
+
 	case "NODE.PING":
 		// Memberlist handles health checks automatically.
 		wr.WriteValue(resp.Error("ERR NODE.PING not supported — memberlist handles health checks"))
@@ -293,6 +310,152 @@ func (s *Server) handleKeyCommand(wr *resp.Writer, args []resp.Value, fn func(ke
 	}
 
 	fn(key, value)
+}
+
+// handleCluster processes CLUSTER subcommands.
+func (s *Server) handleCluster(wr *resp.Writer, args []resp.Value) {
+	if len(args) < 1 {
+		wr.WriteValue(resp.Error("ERR wrong number of arguments for 'CLUSTER' command"))
+		return
+	}
+	sub, ok := getBulkString(args[0])
+	if !ok {
+		wr.WriteValue(resp.Error("ERR invalid CLUSTER subcommand"))
+		return
+	}
+	switch strings.ToUpper(sub) {
+	case "SLOTS":
+		s.handleClusterSlots(wr)
+	case "NODES":
+		s.handleClusterNodes(wr)
+	case "INFO":
+		s.handleClusterInfo(wr)
+	case "KEYSLOT":
+		if len(args) < 2 {
+			wr.WriteValue(resp.Error("ERR wrong number of arguments for 'CLUSTER KEYSLOT' command"))
+			return
+		}
+		key, ok := getBulkString(args[1])
+		if !ok {
+			wr.WriteValue(resp.Error("ERR invalid key"))
+			return
+		}
+		// Compute slot consistently with the hashring
+		slot := int(hashring.HashKey(key) % 16384)
+		wr.WriteValue(resp.Integer(slot))
+	default:
+		wr.WriteValue(resp.Error(fmt.Sprintf("ERR unknown CLUSTER subcommand '%s'", sub)))
+	}
+}
+
+// handleClusterSlots returns the cluster slot-to-node mapping.
+// Format (Valkey): array of [start_slot, end_slot, [ip, port, node_id], ...]
+func (s *Server) handleClusterSlots(wr *resp.Writer) {
+	ranges := s.ring.GetSlotRanges()
+	if len(ranges) == 0 {
+		wr.WriteValue(resp.Error("ERR cluster is empty"))
+		return
+	}
+
+	out := make(resp.Array, 0, len(ranges))
+	for _, sr := range ranges {
+		host, portStr, err := net.SplitHostPort(sr.Node.Address)
+		if err != nil {
+			host = "127.0.0.1"
+			portStr = sr.Node.Address
+		}
+		if host == "" {
+			host = "127.0.0.1"
+		}
+		port, _ := strconv.Atoi(portStr)
+		if port == 0 {
+			port = 6379
+		}
+
+		// Node info: [ip (bulk string), port (int), node_id (bulk string)]
+		// Valkey/redis-cli expects at least 3 elements; node_id is required.
+		nodeID := sr.Node.NodeID
+		if nodeID == "" {
+			nodeID = host
+		}
+
+		entry := resp.Array{
+			resp.Integer(sr.Start),
+			resp.Integer(sr.End),
+			resp.Array{
+				resp.NewBulkString(host),
+				resp.Integer(port),
+				resp.NewBulkString(nodeID),
+			},
+		}
+		out = append(out, entry)
+	}
+	wr.WriteValue(out)
+}
+
+// handleClusterNodes returns node info in CLUSTER NODES format.
+// Format: <id> <ip:port> <flags> <master> <ping> <pong> <epoch> <link> <slots...>
+func (s *Server) handleClusterNodes(wr *resp.Writer) {
+	var buf strings.Builder
+
+	ranges := s.ring.GetSlotRanges()
+	if len(ranges) == 0 {
+		wr.WriteValue(resp.NullBulkString())
+		return
+	}
+
+	// Build slot range string per node
+	nodeSlots := make(map[string][]string)
+	for _, sr := range ranges {
+		id := sr.Node.NodeID
+		if sr.Start == sr.End {
+			nodeSlots[id] = append(nodeSlots[id], fmt.Sprintf("%d", sr.Start))
+		} else {
+			nodeSlots[id] = append(nodeSlots[id], fmt.Sprintf("%d-%d", sr.Start, sr.End))
+		}
+	}
+
+	// Get unique nodes
+	seen := make(map[string]bool)
+	for _, sr := range ranges {
+		id := sr.Node.NodeID
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+
+		host, portStr, err := net.SplitHostPort(sr.Node.Address)
+		if err != nil {
+			host = "127.0.0.1"
+			portStr = sr.Node.Address
+		}
+		if host == "" {
+			host = "127.0.0.1"
+		}
+
+		flags := "myself,master"
+		if id != s.nodeID() {
+			flags = "master"
+		}
+
+		slots := strings.Join(nodeSlots[id], " ")
+		buf.WriteString(fmt.Sprintf("%s %s:%s %s - 0 0 0 connected %s\n", id, host, portStr, flags, slots))
+	}
+
+	wr.WriteValue(resp.NewBulkString(buf.String()))
+}
+
+// handleClusterInfo returns minimal cluster info.
+func (s *Server) handleClusterInfo(wr *resp.Writer) {
+	ranges := s.ring.GetSlotRanges()
+	nodeIDs := make(map[string]bool)
+	for _, sr := range ranges {
+		nodeIDs[sr.Node.NodeID] = true
+	}
+	numNodes := len(nodeIDs)
+
+	info := fmt.Sprintf("cluster_state:ok\r\ncluster_slots_assigned:16384\r\ncluster_slots_ok:16384\r\ncluster_slots_pfail:0\r\ncluster_slots_fail:0\r\ncluster_known_nodes:%d\r\ncluster_size:%d\r\ncluster_current_epoch:1\r\ncluster_my_epoch:0\r\n", numNodes, numNodes)
+	wr.WriteValue(resp.NewBulkString(info))
 }
 
 // getBulkString extracts a string from a RESP BulkString value.

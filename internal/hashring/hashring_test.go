@@ -209,3 +209,77 @@ func TestConcurrentAccess(t *testing.T) {
 		<-done
 	}
 }
+
+func TestGetSlotRangesSingleNode(t *testing.T) {
+	r := New("node-local")
+	r.AddNode("node-a", "10.0.0.1:6379", 256)
+
+	ranges := r.GetSlotRanges()
+	if len(ranges) == 0 {
+		t.Fatal("expected at least 1 range")
+	}
+	if ranges[0].Start != 0 {
+		t.Fatalf("expected first range start 0, got %d", ranges[0].Start)
+	}
+	if ranges[0].End != 16383 {
+		t.Fatalf("expected last range end 16383, got %d", ranges[0].End)
+	}
+	if ranges[0].Node.NodeID != "node-a" {
+		t.Fatalf("expected node-a, got %s", ranges[0].Node.NodeID)
+	}
+	if len(ranges) != 1 {
+		t.Fatalf("expected 1 range for single node, got %d", len(ranges))
+	}
+}
+
+func TestGetSlotRangesTwoNodes(t *testing.T) {
+	r := New("node-local")
+	r.AddNode("node-a", "10.0.0.1:6379", 256)
+	r.AddNode("node-b", "10.0.0.2:6380", 256)
+
+	ranges := r.GetSlotRanges()
+	if len(ranges) < 2 {
+		t.Fatalf("expected at least 2 ranges for 2 nodes, got %d", len(ranges))
+	}
+
+	// Verify all 16384 slots are covered
+	covered := 0
+	nodeIDs := make(map[string]int)
+	for _, sr := range ranges {
+		if sr.End < sr.Start {
+			t.Fatalf("invalid range: %d-%d", sr.Start, sr.End)
+		}
+		covered += sr.End - sr.Start + 1
+		nodeIDs[sr.Node.NodeID]++
+	}
+	if covered != 16384 {
+		t.Fatalf("expected 16384 slots covered, got %d", covered)
+	}
+	// Both nodes should appear
+	if len(nodeIDs) != 2 {
+		t.Fatalf("expected 2 distinct nodes, got %d: %v", len(nodeIDs), nodeIDs)
+	}
+}
+
+func TestGetSlotRangesEmptyRing(t *testing.T) {
+	r := New("node-local")
+	ranges := r.GetSlotRanges()
+	if ranges != nil {
+		t.Fatalf("expected nil for empty ring, got %v", ranges)
+	}
+}
+
+func TestGetSlotRangesAfterRemove(t *testing.T) {
+	r := New("node-local")
+	r.AddNode("node-a", "10.0.0.1:6379", 256)
+	r.AddNode("node-b", "10.0.0.2:6380", 256)
+	r.RemoveNode("node-b")
+
+	ranges := r.GetSlotRanges()
+	if len(ranges) != 1 {
+		t.Fatalf("expected 1 range after removing node-b, got %d", len(ranges))
+	}
+	if ranges[0].Node.NodeID != "node-a" {
+		t.Fatalf("expected node-a, got %s", ranges[0].Node.NodeID)
+	}
+}

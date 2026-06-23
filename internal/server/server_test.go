@@ -339,3 +339,55 @@ func TestNodeJoinAddsToRing(t *testing.T) {
 	}
 	_ = addr
 }
+
+func TestClusterSlots(t *testing.T) {
+	s := New("127.0.0.1:0", "test-node")
+	err := s.ListenAndServe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		s.Shutdown(ctx)
+		s.Wait()
+	}()
+
+	// Add a second node
+	s.Ring().AddNode("node-remote", "10.0.0.1:6379", 256)
+
+	conn, err := net.Dial("tcp", s.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Send CLUSTER SLOTS
+	conn.Write([]byte("*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n"))
+	br := bufio.NewReader(conn)
+	line, _ := br.ReadString('\n')
+	// Should start with * (array response)
+	if !strings.HasPrefix(line, "*") {
+		t.Fatalf("expected array response, got %q", line)
+	}
+}
+
+func TestClusterSlotsUnknownSubcommand(t *testing.T) {
+	addr, cleanup := startTestServer(t)
+	defer cleanup()
+
+	resp := dialResp(t, addr, "*2\r\n$7\r\nCLUSTER\r\n$7\r\nUNKNOWN\r\n")
+	if !strings.HasPrefix(resp, "-ERR unknown CLUSTER subcommand") {
+		t.Fatalf("expected unknown subcommand error, got %q", resp)
+	}
+}
+
+func TestClusterSlotsWrongArity(t *testing.T) {
+	addr, cleanup := startTestServer(t)
+	defer cleanup()
+
+	resp := dialResp(t, addr, "*1\r\n$7\r\nCLUSTER\r\n")
+	if !strings.HasPrefix(resp, "-ERR wrong number of arguments") {
+		t.Fatalf("expected arity error, got %q", resp)
+	}
+}

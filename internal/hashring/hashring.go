@@ -21,6 +21,13 @@ type RingEntryInfo struct {
 	Address string `json:"address"`
 }
 
+// SlotRange represents a contiguous range of hash slots owned by a node.
+type SlotRange struct {
+	Start int
+	End   int
+	Node  Replica
+}
+
 // Hashring is the interface for consistent hash ring implementations.
 type Hashring interface {
 	// AddNode adds a physical node with the given number of virtual replicas.
@@ -34,6 +41,9 @@ type Hashring interface {
 	// responsible for the given key. The first entry is the primary owner.
 	// Returns fewer than count if the ring has fewer nodes.
 	GetReplicas(key string, count int) []Replica
+	// GetSlotRanges returns the 16384 Redis cluster slot ranges mapped to nodes.
+	// Returns an empty slice if the ring is empty.
+	GetSlotRanges() []SlotRange
 	// Nodes returns all physical node IDs currently in the ring.
 	Nodes() []string
 	// RingSnapshot returns every virtual entry on the ring, sorted by hash.
@@ -177,6 +187,65 @@ func (r *consistentHashring) GetReplicas(key string, count int) []Replica {
 	return replicas
 }
 
+// GetSlotRanges returns the 16384 Redis cluster slot ranges mapped to nodes.
+// Each range represents a contiguous block of slots owned by the same node.
+func (r *consistentHashring) GetSlotRanges() []SlotRange {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if len(r.entries) == 0 {
+		return nil
+	}
+
+	// Pre-compute node address map
+	nodeAddrs := make(map[string]string)
+	for _, e := range r.entries {
+		if _, ok := nodeAddrs[e.nodeID]; !ok {
+			nodeAddrs[e.nodeID] = e.address
+		}
+	}
+
+	const numSlots = 16384
+	ranges := make([]SlotRange, 0, len(r.nodes))
+
+	// For each slot, hash the slot index to find the owner on the ring.
+	getSlotOwner := func(slot int) Replica {
+		h := hashKey("SLOT:" + strconv.Itoa(slot))
+		idx := sort.Search(len(r.entries), func(i int) bool {
+			return r.entries[i].hash >= h
+		})
+		if idx == len(r.entries) {
+			idx = 0
+		}
+		e := r.entries[idx]
+		return Replica{NodeID: e.nodeID, Address: nodeAddrs[e.nodeID]}
+	}
+
+	var currentStart int
+	currentOwner := getSlotOwner(0)
+
+	for slot := 1; slot < numSlots; slot++ {
+		owner := getSlotOwner(slot)
+		if owner.NodeID != currentOwner.NodeID {
+			ranges = append(ranges, SlotRange{
+				Start: currentStart,
+				End:   slot - 1,
+				Node:  currentOwner,
+			})
+			currentStart = slot
+			currentOwner = owner
+		}
+	}
+	// Last range
+	ranges = append(ranges, SlotRange{
+		Start: currentStart,
+		End:   numSlots - 1,
+		Node:  currentOwner,
+	})
+
+	return ranges
+}
+
 func (r *consistentHashring) Nodes() []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -198,7 +267,12 @@ func (r *consistentHashring) RingSnapshot() []RingEntryInfo {
 	return out
 }
 
-// hashKey returns a 64-bit hash of the given key using xxHash.
-func hashKey(key string) uint64 {
+// HashKey returns a 64-bit hash of the given key using xxHash.
+func HashKey(key string) uint64 {
 	return xxhash.Sum64String(key)
+}
+
+// hashKey is an alias for HashKey for internal use.
+func hashKey(key string) uint64 {
+	return HashKey(key)
 }
