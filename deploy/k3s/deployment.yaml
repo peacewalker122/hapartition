@@ -4,7 +4,7 @@ metadata:
   name: hapartition
   namespace: hapartition
 spec:
-  replicas: 1
+  replicas: 5
   selector:
     matchLabels:
       app: hapartition
@@ -18,12 +18,11 @@ spec:
           image: ghcr.io/peacewalker122/hapartition:latest
           imagePullPolicy: IfNotPresent
           args:
+            - --node-id=$(POD_NAME)
             - --port=6379
             - --http=8080
             - --gossip-port=7946
-            # Start alone.  When scaling beyond 1 replica, set --join to the
-            # headless service so pods discover each other via gossip, e.g.:
-            # - --join=hapartition-0.hapartition-gossip.hapartition.svc:7946
+            - --join=hapartition-gossip:7946
           env:
             - name: POD_IP
               valueFrom:

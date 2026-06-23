@@ -181,21 +181,61 @@ func (h *Handler) Start() error {
 	if h.cfg.Discoverer != nil {
 		seeds, err := h.cfg.Discoverer.Discover()
 		if err != nil {
-			log.Printf("gossip: discover seeds: %v (continuing without join)", err)
+			log.Printf("gossip: discover seeds: %v (will retry in background)", err)
 		} else if len(seeds) > 0 {
-			joined, err := list.Join(seeds)
+			_, err := list.Join(seeds)
 			if err != nil {
-				log.Printf("gossip: join %v: %v (continuing alone)", seeds, err)
+				log.Printf("gossip: initial join %v: %v (will retry in background)", seeds, err)
 			} else {
-				log.Printf("gossip: joined cluster, %d nodes reachable", joined)
+				log.Printf("gossip: joined cluster")
 			}
 		}
+		// Retry join in background until we see at least one peer.
+		// This handles the K8s bootstrapping case where all pods start
+		// simultaneously and the headless service DNS returns nothing yet.
+		go h.retryJoin(seeds)
 	}
 
 	// Start anti-entropy loop
 	go h.antiEntropyLoop()
 
 	return nil
+}
+
+// retryJoin keeps trying to join seeds until we see at least one peer.
+func (h *Handler) retryJoin(seeds []string) {
+	if len(seeds) == 0 {
+		return
+	}
+	// If we already have peers on first try, nothing to do.
+	if h.memberlist.NumMembers() > 1 {
+		return
+	}
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-h.stopCh:
+			return
+		case <-ticker.C:
+			if h.memberlist.NumMembers() > 1 {
+				return
+			}
+			seeds, err := h.cfg.Discoverer.Discover()
+			if err != nil {
+				log.Printf("gossip: retry discover: %v", err)
+				continue
+			}
+			if len(seeds) == 0 {
+				continue
+			}
+			_, err = h.memberlist.Join(seeds)
+			if err == nil {
+				log.Printf("gossip: joined cluster via retry")
+				return
+			}
+		}
+	}
 }
 
 // Broadcast asynchronously sends a key write to the cluster.
