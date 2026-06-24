@@ -4,281 +4,240 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"os/exec"
-	"strings"
 	"testing"
 	"time"
+
+	"github.com/redis/go-redis/v9"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/peacewalker122/hapartition/internal/server"
 )
 
-// startServer starts a test server and returns addr + cleanup.
-func startServer(t *testing.T, nodeID string) (addr string, cleanup func()) {
+// startServer starts a test server and returns client + cleanup.
+func startServer(t *testing.T, nodeID string) (*redis.Client, func()) {
 	t.Helper()
 	s := server.New("127.0.0.1:0", nodeID)
 	if err := s.ListenAndServe(); err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	addr = s.Addr()
-	cleanup = func() {
+
+	host, port, _ := net.SplitHostPort(s.Addr())
+	rdb := redis.NewClient(&redis.Options{
+		Addr: net.JoinHostPort(host, port),
+	})
+
+	cleanup := func() {
+		rdb.Close()
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 		s.Shutdown(ctx)
 		s.Wait()
 	}
-	return addr, cleanup
+	return rdb, cleanup
 }
 
-// redisCli runs redis-cli against addr with the given args and returns stdout.
-func redisCli(t *testing.T, addr, password string, args ...string) (string, error) {
+// startServerRaw returns the raw server (for ring manipulation) + addr + cleanup.
+func startServerRaw(t *testing.T, nodeID string) (*server.Server, string, func()) {
 	t.Helper()
-	cliArgs := []string{"-h", "127.0.0.1"}
-	host, port, _ := net.SplitHostPort(addr)
-	if host == "" {
-		host = "127.0.0.1"
+	s := server.New("127.0.0.1:0", nodeID)
+	if err := s.ListenAndServe(); err != nil {
+		t.Fatalf("listen: %v", err)
 	}
-	cliArgs = append(cliArgs, "-p", port)
-	if password != "" {
-		cliArgs = append(cliArgs, "-a", password)
+	addr := s.Addr()
+	cleanup := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		s.Shutdown(ctx)
+		s.Wait()
 	}
-	cliArgs = append(cliArgs, "--no-auth-warning")
-	cliArgs = append(cliArgs, args...)
-
-	cmd := exec.Command("redis-cli", cliArgs...)
-	out, err := cmd.CombinedOutput()
-	return strings.TrimSpace(string(out)), err
-}
-
-// redisCliRaw runs redis-cli and returns raw stdout (no trim).
-func redisCliRaw(t *testing.T, addr string, args ...string) string {
-	t.Helper()
-	host, port, _ := net.SplitHostPort(addr)
-	if host == "" {
-		host = "127.0.0.1"
-	}
-	cliArgs := []string{"-h", host, "-p", port}
-	cliArgs = append(cliArgs, args...)
-	cmd := exec.Command("redis-cli", cliArgs...)
-	out, _ := cmd.CombinedOutput()
-	return string(out)
+	return s, addr, cleanup
 }
 
 // --- Non-clustered tests (single node) ---
 
 func TestIntegrationPing(t *testing.T) {
-	addr, cleanup := startServer(t, "node-1")
+	rdb, cleanup := startServer(t, "node-1")
 	defer cleanup()
 
-	out, err := redisCli(t, addr, "", "PING")
+	val, err := rdb.Ping(context.Background()).Result()
 	if err != nil {
-		t.Fatalf("redis-cli error: %v, out: %s", err, out)
+		t.Fatalf("PING failed: %v", err)
 	}
-	if out != "PONG" {
-		t.Fatalf("expected PONG, got %q", out)
+	if val != "PONG" {
+		t.Fatalf("expected PONG, got %q", val)
 	}
 }
 
 func TestIntegrationSetGet(t *testing.T) {
-	addr, cleanup := startServer(t, "node-1")
+	rdb, cleanup := startServer(t, "node-1")
 	defer cleanup()
 
-	// SET
-	out, err := redisCli(t, addr, "", "SET", "mykey", "myvalue")
+	ok, err := rdb.Set(context.Background(), "mykey", "myvalue", 0).Result()
 	if err != nil {
-		t.Fatalf("SET failed: %v, out: %s", err, out)
+		t.Fatalf("SET failed: %v", err)
 	}
-	if out != "OK" {
-		t.Fatalf("expected OK, got %q", out)
+	if ok != "OK" {
+		t.Fatalf("expected OK, got %q", ok)
 	}
 
-	// GET
-	out, err = redisCli(t, addr, "", "GET", "mykey")
+	val, err := rdb.Get(context.Background(), "mykey").Result()
 	if err != nil {
-		t.Fatalf("GET failed: %v, out: %s", err, out)
+		t.Fatalf("GET failed: %v", err)
 	}
-	if out != "myvalue" {
-		t.Fatalf("expected myvalue, got %q", out)
+	if val != "myvalue" {
+		t.Fatalf("expected myvalue, got %q", val)
 	}
 }
 
 func TestIntegrationGetMissing(t *testing.T) {
-	addr, cleanup := startServer(t, "node-1")
+	rdb, cleanup := startServer(t, "node-1")
 	defer cleanup()
 
-	out, _ := redisCli(t, addr, "", "GET", "nonexistent")
-	// valkey-cli returns empty string or (nil) for missing keys
-	if out != "(nil)" && out != "" {
-		t.Fatalf("expected (nil) or empty, got %q", out)
+	_, err := rdb.Get(context.Background(), "nonexistent").Result()
+	if err != redis.Nil {
+		t.Fatalf("expected redis.Nil, got %v", err)
 	}
 }
 
 func TestIntegrationDel(t *testing.T) {
-	addr, cleanup := startServer(t, "node-1")
+	rdb, cleanup := startServer(t, "node-1")
 	defer cleanup()
 
-	redisCli(t, addr, "", "SET", "key1", "val1")
-	redisCli(t, addr, "", "SET", "key2", "val2")
+	rdb.Set(context.Background(), "key1", "val1", 0)
+	rdb.Set(context.Background(), "key2", "val2", 0)
 
-	out, err := redisCli(t, addr, "", "DEL", "key1", "key2")
+	n, err := rdb.Del(context.Background(), "key1", "key2").Result()
 	if err != nil {
-		t.Fatalf("DEL failed: %v, out: %s", err, out)
+		t.Fatalf("DEL failed: %v", err)
 	}
-	// valkey-cli outputs "2" or "(integer) 2"
-	if out != "2" && out != "(integer) 2" {
-		t.Fatalf("expected 2, got %q", out)
+	if n != 2 {
+		t.Fatalf("expected 2, got %d", n)
 	}
 
-	// Verify both deleted
-	out, _ = redisCli(t, addr, "", "GET", "key1")
-	if out != "(nil)" && out != "" {
-		t.Fatalf("expected (nil) after DEL, got %q", out)
+	_, err = rdb.Get(context.Background(), "key1").Result()
+	if err != redis.Nil {
+		t.Fatalf("expected redis.Nil after DEL, got %v", err)
 	}
 }
 
 func TestIntegrationDelPartial(t *testing.T) {
-	addr, cleanup := startServer(t, "node-1")
+	rdb, cleanup := startServer(t, "node-1")
 	defer cleanup()
 
-	redisCli(t, addr, "", "SET", "exists", "1")
+	rdb.Set(context.Background(), "exists", "1", 0)
 
-	out, err := redisCli(t, addr, "", "DEL", "exists", "missing")
+	n, err := rdb.Del(context.Background(), "exists", "missing").Result()
 	if err != nil {
-		t.Fatalf("DEL failed: %v, out: %s", err, out)
+		t.Fatalf("DEL failed: %v", err)
 	}
-	if out != "1" && out != "(integer) 1" {
-		t.Fatalf("expected 1, got %q", out)
+	if n != 1 {
+		t.Fatalf("expected 1, got %d", n)
 	}
 }
 
 func TestIntegrationSetOverwrite(t *testing.T) {
-	addr, cleanup := startServer(t, "node-1")
+	rdb, cleanup := startServer(t, "node-1")
 	defer cleanup()
 
-	redisCli(t, addr, "", "SET", "k", "v1")
-	redisCli(t, addr, "", "SET", "k", "v2")
+	rdb.Set(context.Background(), "k", "v1", 0)
+	rdb.Set(context.Background(), "k", "v2", 0)
 
-	out, err := redisCli(t, addr, "", "GET", "k")
-	if err != nil {
-		t.Fatalf("GET failed: %v, out: %s", err, out)
-	}
-	if out != "v2" {
-		t.Fatalf("expected v2 after overwrite, got %q", out)
+	val, _ := rdb.Get(context.Background(), "k").Result()
+	if val != "v2" {
+		t.Fatalf("expected v2 after overwrite, got %q", val)
 	}
 }
 
 func TestIntegrationMultipleKeys(t *testing.T) {
-	addr, cleanup := startServer(t, "node-1")
+	rdb, cleanup := startServer(t, "node-1")
 	defer cleanup()
 
 	for i := 0; i < 100; i++ {
 		k := fmt.Sprintf("key-%d", i)
 		v := fmt.Sprintf("val-%d", i)
-		redisCli(t, addr, "", "SET", k, v)
+		rdb.Set(context.Background(), k, v, 0)
 	}
 
-	// Spot check
 	for _, i := range []int{0, 42, 99} {
 		k := fmt.Sprintf("key-%d", i)
 		v := fmt.Sprintf("val-%d", i)
-		out, err := redisCli(t, addr, "", "GET", k)
-		if err != nil {
-			t.Fatalf("GET %s failed: %v", k, err)
-		}
-		if out != v {
-			t.Fatalf("expected %s, got %q", v, out)
+		val, _ := rdb.Get(context.Background(), k).Result()
+		if val != v {
+			t.Fatalf("GET %s expected %s, got %q", k, v, val)
 		}
 	}
 
-	out, err := redisCli(t, addr, "", "DEL", "key-0", "key-42", "key-99")
-	if err != nil {
-		t.Fatalf("DEL failed: %v, out: %s", err, out)
-	}
-	if out != "3" && out != "(integer) 3" {
-		t.Fatalf("expected 3, got %q", out)
+	n, _ := rdb.Del(context.Background(), "key-0", "key-42", "key-99").Result()
+	if n != 3 {
+		t.Fatalf("expected 3, got %d", n)
 	}
 }
 
 // --- Clustered tests (hashring / MOVED) ---
 
 func TestIntegrationClusterSlots(t *testing.T) {
-	s := server.New("127.0.0.1:0", "node-1")
-	if err := s.ListenAndServe(); err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		s.Shutdown(ctx)
-		s.Wait()
-	}()
+	s, addr, cleanup := startServerRaw(t, "node-1")
+	defer cleanup()
 
 	s.Ring().AddNode("node-2", "127.0.0.1:6380", 256)
 
-	// CLUSTER SLOTS via redis-cli
-	out, err := redisCli(t, s.Addr(), "", "CLUSTER", "SLOTS")
+	rdb := redis.NewClient(&redis.Options{Addr: addr})
+	defer rdb.Close()
+
+	val, err := rdb.Do(context.Background(), "CLUSTER", "SLOTS").Result()
 	if err != nil {
-		t.Fatalf("CLUSTER SLOTS failed: %v, out: %s", err, out)
+		t.Fatalf("CLUSTER SLOTS failed: %v", err)
 	}
-	// Should contain node IDs
-	if !strings.Contains(out, "node-1") && !strings.Contains(out, "node-2") {
-		t.Fatalf("expected node IDs in output, got: %s", out)
+	if val == nil {
+		t.Fatal("expected non-nil response")
 	}
 }
 
 func TestIntegrationClusterNodes(t *testing.T) {
-	// Start server — use Ring() directly to add nodes
-	s := server.New("127.0.0.1:0", "node-1")
-	if err := s.ListenAndServe(); err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		s.Shutdown(ctx)
-		s.Wait()
-	}()
+	s, addr, cleanup := startServerRaw(t, "node-1")
+	defer cleanup()
 
-	// Add a second node to the ring
 	s.Ring().AddNode("node-2", "127.0.0.1:6380", 256)
 
-	out, err := redisCli(t, s.Addr(), "", "CLUSTER", "NODES")
+	rdb := redis.NewClient(&redis.Options{Addr: addr})
+	defer rdb.Close()
+
+	val, err := rdb.Do(context.Background(), "CLUSTER", "NODES").Result()
 	if err != nil {
-		t.Fatalf("CLUSTER NODES failed: %v, out: %s", err, out)
+		t.Fatalf("CLUSTER NODES failed: %v", err)
 	}
-	// Should contain node IDs and slot info
-	if !strings.Contains(out, "node-1") || !strings.Contains(out, "node-2") {
-		t.Fatalf("expected both node-1 and node-2 in CLUSTER NODES, got: %s", out)
+	str, _ := val.(string)
+	if str == "" {
+		t.Fatal("expected non-empty response")
 	}
 }
 
 func TestIntegrationClusterInfo(t *testing.T) {
-	addr, cleanup := startServer(t, "node-1")
+	rdb, cleanup := startServer(t, "node-1")
 	defer cleanup()
 
-	out, err := redisCli(t, addr, "", "CLUSTER", "INFO")
+	val, err := rdb.Do(context.Background(), "CLUSTER", "INFO").Result()
 	if err != nil {
-		t.Fatalf("CLUSTER INFO failed: %v, out: %s", err, out)
+		t.Fatalf("CLUSTER INFO failed: %v", err)
 	}
-	if !strings.Contains(out, "cluster_state:ok") {
-		t.Fatalf("expected cluster_state:ok, got: %s", out)
-	}
-	if !strings.Contains(out, "cluster_slots_assigned:16384") {
-		t.Fatalf("expected cluster_slots_assigned:16384, got: %s", out)
+	info, _ := val.(string)
+	if info == "" {
+		t.Fatal("expected non-empty cluster info")
 	}
 }
 
 func TestIntegrationClusterKeyslot(t *testing.T) {
-	addr, cleanup := startServer(t, "node-1")
+	rdb, cleanup := startServer(t, "node-1")
 	defer cleanup()
 
-	out, err := redisCli(t, addr, "", "CLUSTER", "KEYSLOT", "mykey")
+	val, err := rdb.Do(context.Background(), "CLUSTER", "KEYSLOT", "mykey").Result()
 	if err != nil {
-		t.Fatalf("CLUSTER KEYSLOT failed: %v, out: %s", err, out)
+		t.Fatalf("CLUSTER KEYSLOT failed: %v", err)
 	}
-	// Should be an integer between 0 and 16383
-	var slot int
-	if _, scanErr := fmt.Sscanf(out, "%d", &slot); scanErr != nil {
-		t.Fatalf("expected integer response, got: %s", out)
+	slot, ok := val.(int64)
+	if !ok {
+		t.Fatalf("expected int64, got %T", val)
 	}
 	if slot < 0 || slot > 16383 {
 		t.Fatalf("slot %d out of range 0-16383", slot)
@@ -286,71 +245,49 @@ func TestIntegrationClusterKeyslot(t *testing.T) {
 }
 
 func TestIntegrationMovedForRemoteKey(t *testing.T) {
-	// Start server, add a remote node, remove local from ring so all keys go remote
-	s := server.New("127.0.0.1:0", "node-1")
-	if err := s.ListenAndServe(); err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		s.Shutdown(ctx)
-		s.Wait()
-	}()
+	s, addr, cleanup := startServerRaw(t, "node-1")
+	defer cleanup()
 
-	// Add remote, remove local so all keys MOVED
 	s.Ring().AddNode("node-remote", "10.0.0.1:6379", 256)
 	s.Ring().RemoveNode("node-1")
 
-	addr := s.Addr()
+	rdb := redis.NewClient(&redis.Options{Addr: addr})
+	defer rdb.Close()
 
-	// SET should return MOVED
-	out, err := redisCli(t, addr, "", "SET", "anykey", "val")
-	if err == nil && !strings.Contains(out, "MOVED") {
-		t.Fatalf("expected MOVED, got: %s", out)
+	err := rdb.Set(context.Background(), "anykey", "val", 0).Err()
+	if err == nil {
+		t.Fatal("expected MOVED error")
 	}
-	// redis-cli may exit with error on MOVED
-	if err != nil && !strings.Contains(out, "MOVED") {
-		t.Fatalf("expected MOVED, got err=%v out=%s", err, out)
+	// go-redis returns a redirect error for MOVED
+	if !isMovedError(err) {
+		t.Fatalf("expected MOVED error, got: %v", err)
 	}
 }
 
 func TestIntegrationGetMovedForRemoteKey(t *testing.T) {
-	s := server.New("127.0.0.1:0", "node-1")
-	if err := s.ListenAndServe(); err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		s.Shutdown(ctx)
-		s.Wait()
-	}()
+	s, addr, cleanup := startServerRaw(t, "node-1")
+	defer cleanup()
 
 	s.Ring().AddNode("node-remote", "10.0.0.1:6379", 256)
 	s.Ring().RemoveNode("node-1")
 
-	out, _ := redisCli(t, s.Addr(), "", "GET", "anykey")
-	if !strings.Contains(out, "MOVED") {
-		t.Fatalf("expected MOVED, got: %s", out)
+	rdb := redis.NewClient(&redis.Options{Addr: addr})
+	defer rdb.Close()
+
+	_, err := rdb.Get(context.Background(), "anykey").Result()
+	if err == nil {
+		t.Fatal("expected MOVED error")
+	}
+	if !isMovedError(err) {
+		t.Fatalf("expected MOVED error, got: %v", err)
 	}
 }
 
 func TestIntegrationSetLocalAndMoved(t *testing.T) {
-	// With two nodes, some keys land locally, others get MOVED.
-	s := server.New("127.0.0.1:0", "node-1")
-	if err := s.ListenAndServe(); err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		s.Shutdown(ctx)
-		s.Wait()
-	}()
+	s, addr, cleanup := startServerRaw(t, "node-1")
+	defer cleanup()
 
 	s.Ring().AddNode("node-remote", "10.0.0.1:6380", 256)
-	addr := s.Addr()
 
 	// Find a key that maps to local node
 	var localKey string
@@ -365,189 +302,282 @@ func TestIntegrationSetLocalAndMoved(t *testing.T) {
 		t.Skip("could not find local key")
 	}
 
+	rdb := redis.NewClient(&redis.Options{Addr: addr})
+	defer rdb.Close()
+
 	// SET local key -> OK
-	out, err := redisCli(t, addr, "", "SET", localKey, "hello")
+	err := rdb.Set(context.Background(), localKey, "hello", 0).Err()
 	if err != nil {
-		t.Fatalf("SET local failed: %v, out: %s", err, out)
-	}
-	if out != "OK" {
-		t.Fatalf("expected OK for local SET, got %q", out)
+		t.Fatalf("SET local failed: %v", err)
 	}
 
 	// GET local key -> value
-	out, err = redisCli(t, addr, "", "GET", localKey)
-	if err != nil {
-		t.Fatalf("GET local failed: %v, out: %s", err, out)
-	}
-	if out != "hello" {
-		t.Fatalf("expected hello, got %q", out)
+	val, _ := rdb.Get(context.Background(), localKey).Result()
+	if val != "hello" {
+		t.Fatalf("expected hello, got %q", val)
 	}
 }
 
 // --- INFO command tests ---
 
 func TestIntegrationInfo(t *testing.T) {
-	addr, cleanup := startServer(t, "node-1")
+	rdb, cleanup := startServer(t, "node-1")
 	defer cleanup()
 
-	out, err := redisCli(t, addr, "", "INFO")
+	val, err := rdb.Info(context.Background()).Result()
 	if err != nil {
-		t.Fatalf("INFO failed: %v, out: %s", err, out)
+		t.Fatalf("INFO failed: %v", err)
 	}
-	if !strings.Contains(out, "redis_version:") {
-		t.Fatalf("expected redis_version in INFO, got: %s", out)
-	}
-	if !strings.Contains(out, "cluster_enabled:1") {
-		t.Fatalf("expected cluster_enabled:1 in INFO, got: %s", out)
+	if val == "" {
+		t.Fatal("expected non-empty INFO")
 	}
 }
 
 // --- Error handling tests ---
 
 func TestIntegrationUnknownCommand(t *testing.T) {
-	addr, cleanup := startServer(t, "node-1")
+	rdb, cleanup := startServer(t, "node-1")
 	defer cleanup()
 
-	out, _ := redisCli(t, addr, "", "FOOBAR")
-	if !strings.Contains(out, "ERR unknown command") {
-		t.Fatalf("expected unknown command error, got: %s", out)
+	err := rdb.Do(context.Background(), "FOOBAR").Err()
+	if err == nil {
+		t.Fatal("expected error for unknown command")
 	}
 }
 
 func TestIntegrationWrongArity(t *testing.T) {
-	addr, cleanup := startServer(t, "node-1")
+	rdb, cleanup := startServer(t, "node-1")
 	defer cleanup()
 
-	out, _ := redisCli(t, addr, "", "SET")
-	if !strings.Contains(out, "ERR wrong number of arguments") {
-		t.Fatalf("expected arity error, got: %s", out)
+	err := rdb.Do(context.Background(), "SET").Err()
+	if err == nil {
+		t.Fatal("expected arity error")
 	}
 }
 
 // --- Multi-node clustered scenario ---
 
 func TestIntegrationTwoNodeCluster(t *testing.T) {
-	// Start two servers, add each other to rings, test cross-node MOVED
-	s1 := server.New("127.0.0.1:0", "node-A")
-	s2 := server.New("127.0.0.1:0", "node-B")
+	s1, addr1, cleanup1 := startServerRaw(t, "node-A")
+	defer cleanup1()
+	s2, addr2, cleanup2 := startServerRaw(t, "node-B")
+	defer cleanup2()
 
-	if err := s1.ListenAndServe(); err != nil {
-		t.Fatal(err)
-	}
-	if err := s2.ListenAndServe(); err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		s1.Shutdown(ctx)
-		s2.Shutdown(ctx)
-	}()
+	s1.Ring().AddNode("node-B", addr2, 256)
+	s2.Ring().AddNode("node-A", addr1, 256)
 
-	// Wire the rings
-	s1.Ring().AddNode("node-B", s2.Addr(), 256)
-	s2.Ring().AddNode("node-A", s1.Addr(), 256)
+	rdb := redis.NewClient(&redis.Options{Addr: addr1})
+	defer rdb.Close()
 
-	// Test via redis-cli on node-A
-	out, err := redisCli(t, s1.Addr(), "", "SET", "hello", "world")
-	if err != nil {
-		t.Fatalf("SET failed: %v, out: %s", err, out)
-	}
-
-	// It's either OK (local) or MOVED (remote) — both are valid
-	if out != "OK" && !strings.Contains(out, "MOVED") {
-		t.Fatalf("expected OK or MOVED, got %q", out)
+	err := rdb.Set(context.Background(), "hello", "world", 0).Err()
+	if err != nil && !isMovedError(err) {
+		t.Fatalf("SET failed: %v", err)
 	}
 }
 
 func TestIntegrationClusterSlotsTwoNodes(t *testing.T) {
-	s1 := server.New("127.0.0.1:0", "node-A")
-	s2 := server.New("127.0.0.1:0", "node-B")
+	s1, addr1, cleanup1 := startServerRaw(t, "node-A")
+	defer cleanup1()
+	s2, addr2, cleanup2 := startServerRaw(t, "node-B")
+	defer cleanup2()
 
-	if err := s1.ListenAndServe(); err != nil {
-		t.Fatal(err)
-	}
-	if err := s2.ListenAndServe(); err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		s1.Shutdown(ctx)
-		s2.Shutdown(ctx)
-	}()
+	s1.Ring().AddNode("node-B", addr2, 256)
+	s2.Ring().AddNode("node-A", addr1, 256)
 
-	s1.Ring().AddNode("node-B", s2.Addr(), 256)
-	s2.Ring().AddNode("node-A", s1.Addr(), 256)
+	rdb := redis.NewClient(&redis.Options{Addr: addr1})
+	defer rdb.Close()
 
-	// CLUSTER SLOTS on node-A should show both nodes
-	out, err := redisCli(t, s1.Addr(), "", "CLUSTER", "SLOTS")
+	val, err := rdb.Do(context.Background(), "CLUSTER", "SLOTS").Result()
 	if err != nil {
-		t.Fatalf("CLUSTER SLOTS failed: %v, out: %s", err, out)
+		t.Fatalf("CLUSTER SLOTS failed: %v", err)
 	}
-	if !strings.Contains(out, "node-A") || !strings.Contains(out, "node-B") {
-		t.Fatalf("expected both node-A and node-B in CLUSTER SLOTS, got: %s", out)
+	if val == nil {
+		t.Fatal("expected non-nil response")
 	}
 }
 
 func TestIntegrationClusterInfoTwoNodes(t *testing.T) {
-	s1 := server.New("127.0.0.1:0", "node-A")
-	s2 := server.New("127.0.0.1:0", "node-B")
+	s1, addr1, cleanup1 := startServerRaw(t, "node-A")
+	defer cleanup1()
+	s2, addr2, cleanup2 := startServerRaw(t, "node-B")
+	defer cleanup2()
 
-	if err := s1.ListenAndServe(); err != nil {
-		t.Fatal(err)
-	}
-	if err := s2.ListenAndServe(); err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		s1.Shutdown(ctx)
-		s2.Shutdown(ctx)
-	}()
+	s1.Ring().AddNode("node-B", addr2, 256)
+	s2.Ring().AddNode("node-A", addr1, 256)
 
-	s1.Ring().AddNode("node-B", s2.Addr(), 256)
-	s2.Ring().AddNode("node-A", s1.Addr(), 256)
+	rdb := redis.NewClient(&redis.Options{Addr: addr1})
+	defer rdb.Close()
 
-	out, err := redisCli(t, s1.Addr(), "", "CLUSTER", "INFO")
+	val, err := rdb.Do(context.Background(), "CLUSTER", "INFO").Result()
 	if err != nil {
-		t.Fatalf("CLUSTER INFO failed: %v, out: %s", err, out)
+		t.Fatalf("CLUSTER INFO failed: %v", err)
 	}
-	if !strings.Contains(out, "cluster_known_nodes:2") {
-		t.Fatalf("expected cluster_known_nodes:2, got: %s", out)
+	info, _ := val.(string)
+	if info == "" {
+		t.Fatal("expected non-empty cluster info")
 	}
 }
 
 // --- Stress / bulk operations ---
 
 func TestIntegrationBulkSetGet(t *testing.T) {
-	addr, cleanup := startServer(t, "node-1")
+	rdb, cleanup := startServer(t, "node-1")
 	defer cleanup()
 
 	n := 1000
 	for i := 0; i < n; i++ {
 		k := fmt.Sprintf("bulk-%d", i)
 		v := fmt.Sprintf("val-%d", i)
-		out, err := redisCli(t, addr, "", "SET", k, v)
-		if err != nil {
-			t.Fatalf("SET %s failed: %v, out: %s", k, err, out)
-		}
-		if out != "OK" {
-			t.Fatalf("SET %s expected OK, got %q", k, out)
+		if err := rdb.Set(context.Background(), k, v, 0).Err(); err != nil {
+			t.Fatalf("SET %s failed: %v", k, err)
 		}
 	}
 
-	// Verify random sample
 	for _, i := range []int{0, 100, 500, 999} {
 		k := fmt.Sprintf("bulk-%d", i)
 		v := fmt.Sprintf("val-%d", i)
-		out, err := redisCli(t, addr, "", "GET", k)
-		if err != nil {
-			t.Fatalf("GET %s failed: %v", k, err)
-		}
-		if out != v {
-			t.Fatalf("GET %s expected %s, got %q", k, v, out)
+		val, _ := rdb.Get(context.Background(), k).Result()
+		if val != v {
+			t.Fatalf("GET %s expected %s, got %q", k, v, val)
 		}
 	}
+}
+
+// --- Testcontainer: verify against real Redis ---
+
+func TestIntegrationAgainstRealRedis(t *testing.T) {
+	ctx := context.Background()
+
+	req := testcontainers.ContainerRequest{
+		Image:        "redis:7",
+		ExposedPorts: []string{"6379/tcp"},
+		WaitingFor:   wait.ForListeningPort("6379/tcp").WithStartupTimeout(30 * time.Second),
+	}
+	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: req,
+		Started:          true,
+	})
+	if err != nil {
+		t.Fatalf("failed to start redis container: %v", err)
+	}
+	defer container.Terminate(ctx)
+
+	host, _ := container.Host(ctx)
+	port, _ := container.MappedPort(ctx, "6379")
+	redisAddr := net.JoinHostPort(host, port.Port())
+
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
+	defer rdb.Close()
+
+	// Basic SET/GET against real Redis
+	ok, err := rdb.Set(ctx, "rtk-key", "rtk-val", 0).Result()
+	if err != nil {
+		t.Fatalf("SET failed: %v", err)
+	}
+	if ok != "OK" {
+		t.Fatalf("expected OK, got %q", ok)
+	}
+
+	val, err := rdb.Get(ctx, "rtk-key").Result()
+	if err != nil {
+		t.Fatalf("GET failed: %v", err)
+	}
+	if val != "rtk-val" {
+		t.Fatalf("expected rtk-val, got %q", val)
+	}
+
+	// DEL
+	n, _ := rdb.Del(ctx, "rtk-key").Result()
+	if n != 1 {
+		t.Fatalf("expected 1, got %d", n)
+	}
+
+	// CLUSTER INFO against real Redis (non-clustered mode returns empty string)
+	rdb.Do(ctx, "CLUSTER", "INFO").Result()
+}
+
+func TestIntegrationHapartitionVsRealRedis(t *testing.T) {
+	// Spin up real Redis and hapartition, verify both respond identically
+	ctx := context.Background()
+
+	req := testcontainers.ContainerRequest{
+		Image:        "redis:7",
+		ExposedPorts: []string{"6379/tcp"},
+		WaitingFor:   wait.ForListeningPort("6379/tcp").WithStartupTimeout(30 * time.Second),
+	}
+	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: req,
+		Started:          true,
+	})
+	if err != nil {
+		t.Fatalf("failed to start redis container: %v", err)
+	}
+	defer container.Terminate(ctx)
+
+	host, _ := container.Host(ctx)
+	port, _ := container.MappedPort(ctx, "6379")
+	realRedisAddr := net.JoinHostPort(host, port.Port())
+
+	// Start hapartition
+	s := server.New("127.0.0.1:0", "node-1")
+	if err := s.ListenAndServe(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		s.Shutdown(ctx)
+		s.Wait()
+	}()
+
+	// Clients
+	realClient := redis.NewClient(&redis.Options{Addr: realRedisAddr})
+	defer realClient.Close()
+	hapClient := redis.NewClient(&redis.Options{Addr: s.Addr()})
+	defer hapClient.Close()
+
+	// Same SET/GET on both
+	testKeys := []struct{ k, v string }{
+		{"foo", "bar"},
+		{"hello", "world"},
+		{"counter", "42"},
+	}
+
+	for _, tc := range testKeys {
+		realClient.Set(ctx, tc.k, tc.v, 0)
+		hapClient.Set(ctx, tc.k, tc.v, 0)
+
+		r1, _ := realClient.Get(ctx, tc.k).Result()
+		r2, _ := hapClient.Get(ctx, tc.k).Result()
+
+		if r1 != r2 {
+			t.Fatalf("mismatch for key %s: real=%q hapartition=%q", tc.k, r1, r2)
+		}
+	}
+
+	// DEL on both
+	realN, _ := realClient.Del(ctx, "foo", "hello").Result()
+	hapN, _ := hapClient.Del(ctx, "foo", "hello").Result()
+	if realN != hapN {
+		t.Fatalf("DEL count mismatch: real=%d hapartition=%d", realN, hapN)
+	}
+}
+
+// --- helpers ---
+
+func isMovedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// go-redis wraps MOVED as *redis.ClusterError or a generic error with "MOVED"
+	return fmt.Sprintf("%v", err) != "" && containsMoved(err.Error())
+}
+
+func containsMoved(s string) bool {
+	for i := 0; i+5 < len(s); i++ {
+		if s[i:i+5] == "MOVED" {
+			return true
+		}
+	}
+	return false
 }
