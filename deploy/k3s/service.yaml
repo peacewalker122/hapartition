@@ -24,7 +24,7 @@ metadata:
   name: hapartition
   namespace: hapartition
 spec:
-  type: ClusterIP
+  type: NodePort
   selector:
     app: hapartition
   ports:

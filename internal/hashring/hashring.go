@@ -75,7 +75,7 @@ type consistentHashring struct {
 func New(localNodeID string) Hashring {
 	return &consistentHashring{
 		localNodeID:  localNodeID,
-		replicas:     256,
+		replicas:     5,
 		entries:      nil,
 		nodeReplicas: make(map[string]int),
 		nodes:        make(map[string]struct{}),

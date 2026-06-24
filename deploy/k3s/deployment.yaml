@@ -18,7 +18,6 @@ spec:
           image: ghcr.io/peacewalker122/hapartition:latest
           imagePullPolicy: IfNotPresent
           args:
-            - --node-id=$(POD_NAME)
             - --port=6379
             - --http=8080
             - --gossip-port=7946
