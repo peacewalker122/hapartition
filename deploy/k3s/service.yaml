@@ -1,6 +1,6 @@
 ---
-# Headless service — each pod gets a DNS A/AAAA record so gossip peers can
-# discover each other by resolving the service name.
+# Headless service — gossip peer discovery via DNS.
+# Each pod gets: hapartition-0.hapartition-gossip.hapartition.svc.cluster.local
 apiVersion: v1
 kind: Service
 metadata:
@@ -16,8 +16,10 @@ spec:
     - port: 7946
       name: gossip
       protocol: TCP
+
 ---
-# Client-facing service — Redis-compatible port + HTTP management.
+# NodePort service — external access via minikube.
+# minikube service tunnels directly to pods, no LoadBalancer needed.
 apiVersion: v1
 kind: Service
 metadata:

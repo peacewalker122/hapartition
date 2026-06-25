@@ -52,6 +52,13 @@ func (s *Server) SetGossip(g *gossip.Handler) {
 	s.gossip = g
 }
 
+// SetAdvertiseAddr updates the local node's address in the hashring to the
+// given routable address. This is needed in K8s where the server binds to
+// :port but other nodes (and MOVED redirects) need the pod IP.
+func (s *Server) SetAdvertiseAddr(addr string) {
+	s.ring.AddNode(s.localID, addr, 256)
+}
+
 // ListenAndServe starts the TCP listener and accept loop.
 func (s *Server) ListenAndServe() error {
 	ln, err := net.Listen("tcp", s.addr)

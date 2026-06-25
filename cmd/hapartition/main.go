@@ -23,6 +23,7 @@ func main() {
 	gossipPort := flag.Int("gossip-port", 7946, "Gossip (memberlist) port")
 	gossipJoin := flag.String("join", "", "Comma-separated gossip seed addresses (host:port)")
 	replicaRF := flag.Int("rf", 2, "Replication factor")
+	advertiseAddr := flag.String("advertise-addr", "", "Address advertised in MOVED redirects and gossip meta (default: :<port>)")
 	flag.Parse()
 
 	id := *nodeID
@@ -35,16 +36,25 @@ func main() {
 	}
 
 	redisAddr := ":" + *redisPort
+	ringAddr := *advertiseAddr
+	if ringAddr == "" {
+		ringAddr = redisAddr
+	}
 
 	// Create the Redis-compatible TCP server
 	redisSrv := server.New(redisAddr, id)
+	// Use the advertised address for hashring entries so MOVED redirects
+	// point to the routable pod address instead of :port
+	if ringAddr != redisAddr {
+		redisSrv.SetAdvertiseAddr(ringAddr)
+	}
 
 	// Create gossip handler with memberlist
 	gossipCfg := gossip.Config{
 		NodeID:         id,
 		BindAddr:       "0.0.0.0",
 		BindPort:       *gossipPort,
-		RedisAddr:      redisAddr,
+		RedisAddr:      ringAddr,
 		Store:          redisSrv.Store(),
 		Ring:           redisSrv.Ring(),
 		ReplicaRF:      *replicaRF,
