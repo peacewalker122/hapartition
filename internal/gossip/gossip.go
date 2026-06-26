@@ -1,6 +1,7 @@
 package gossip
 
 import (
+	"crypto/tls"
 	"fmt"
 	"log"
 	"sync"
@@ -84,6 +85,7 @@ type Config struct {
 	ReplicaRF      int               // replication factor (number of replicas per key)
 	Discoverer     Discoverer        // seed discovery
 	AntiEntropySec int               // anti-entropy interval in seconds (default 30)
+	TLSConfig      *tls.Config       // optional mTLS config for gossip TCP streams
 }
 
 // Handler wraps memberlist and implements the Delegate + EventDelegate for
@@ -164,6 +166,14 @@ func (h *Handler) Start() error {
 	cfg.Events = h.delegate
 	cfg.LogOutput = log.Default().Writer()
 	cfg.EnableCompression = true
+
+	if h.cfg.TLSConfig != nil {
+		tlsTransport, err := NewTLSTransport(cfg, h.cfg.TLSConfig, log.Default())
+		if err != nil {
+			return fmt.Errorf("gossip: create tls transport: %w", err)
+		}
+		cfg.Transport = tlsTransport
+	}
 
 	list, err := memberlist.Create(cfg)
 	if err != nil {

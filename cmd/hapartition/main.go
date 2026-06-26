@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"fmt"
 	"log"
@@ -23,6 +25,10 @@ func main() {
 	gossipPort := flag.Int("gossip-port", 7946, "Gossip (memberlist) port")
 	gossipJoin := flag.String("join", "", "Comma-separated gossip seed addresses (host:port)")
 	replicaRF := flag.Int("rf", 2, "Replication factor")
+	tlsCert := flag.String("tls-cert", "", "TLS certificate file for mTLS")
+	tlsKey := flag.String("tls-key", "", "TLS private key file for mTLS")
+	tlsCA := flag.String("tls-ca", "", "CA certificate file for verifying peer certificates")
+	tlsInsecure := flag.Bool("tls-insecure", false, "Skip peer certificate verification (insecure, not recommended)")
 	advertiseAddr := flag.String("advertise-addr", "", "Address advertised in MOVED redirects and gossip meta (default: :<port>)")
 	flag.Parse()
 
@@ -59,6 +65,48 @@ func main() {
 		Ring:           redisSrv.Ring(),
 		ReplicaRF:      *replicaRF,
 		AntiEntropySec: 30,
+	}
+
+	// Load TLS config for mTLS gossip.
+	if *tlsCert != "" && *tlsKey != "" {
+		cert, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
+		if err != nil {
+			log.Fatalf("tls: load cert/key: %v", err)
+		}
+
+		var caPool *x509.CertPool
+		if *tlsCA != "" {
+			caPEM, err := os.ReadFile(*tlsCA)
+			if err != nil {
+				log.Fatalf("tls: read CA: %v", err)
+			}
+			caPool = x509.NewCertPool()
+			if !caPool.AppendCertsFromPEM(caPEM) {
+				log.Fatalf("tls: no certificates found in CA file")
+			}
+		} else {
+			// Use the system root pool as a fallback when no CA is specified.
+			// In mTLS, the CA is what both sides trust, so this is usually
+			// what you want when using a private CA bundle.
+			var err error
+			caPool, err = x509.SystemCertPool()
+			if err != nil {
+				log.Fatalf("tls: system cert pool: %v", err)
+			}
+		}
+
+		tlsCfg := &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			ClientAuth:   tls.RequireAndVerifyClientCert,
+			ClientCAs:    caPool,
+			RootCAs:      caPool,
+			MinVersion:   tls.VersionTLS12,
+		}
+		if *tlsInsecure {
+			tlsCfg.InsecureSkipVerify = true
+			tlsCfg.ClientAuth = tls.VerifyClientCertIfGiven
+		}
+		gossipCfg.TLSConfig = tlsCfg
 	}
 
 	// Set up static discoverer if --join is provided
