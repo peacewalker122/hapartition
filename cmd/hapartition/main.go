@@ -101,6 +101,9 @@ func main() {
 			ClientCAs:    caPool,
 			RootCAs:      caPool,
 			MinVersion:   tls.VersionTLS12,
+			// memberlist connects by pod IP; set ServerName to a SAN that
+			// exists on every peer's cert so hostname verification passes.
+			ServerName: "hapartition",
 		}
 		if *tlsInsecure {
 			tlsCfg.InsecureSkipVerify = true

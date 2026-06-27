@@ -137,7 +137,10 @@ func (t *TLSTransport) WriteToAddress(b []byte, addr memberlist.Address) (time.T
 // hostname verification unless InsecureSkipVerify is true.
 func (t *TLSTransport) dialTLSConfig(serverName string) *tls.Config {
 	cfg := t.tlsConfig.Clone()
-	if serverName != "" {
+	// Only override ServerName if the base config didn't set one.
+	// In k8s, memberlist node names (e.g. "hapartition-0") aren't valid DNS
+	// SANs, so the caller should set a ServerName that matches the cert.
+	if serverName != "" && cfg.ServerName == "" {
 		cfg.ServerName = serverName
 	}
 	return cfg
