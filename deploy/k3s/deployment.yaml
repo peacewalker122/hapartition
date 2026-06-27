@@ -5,7 +5,7 @@ metadata:
   namespace: hapartition
 spec:
   serviceName: hapartition-gossip
-  replicas: 2
+  replicas: 3
   selector:
     matchLabels:
       app: hapartition
@@ -23,7 +23,12 @@ spec:
             - --port=6379
             - --http=8080
             - --gossip-port=7946
+            - --advertise-addr=$(POD_IP):6379
             - --join=hapartition-gossip:7946
+            - --tls-insecure
+            - --tls-cert=/etc/tls/$(POD_NAME)/tls.crt
+            - --tls-key=/etc/tls/$(POD_NAME)/tls.key
+            - --tls-ca=/etc/tls/$(POD_NAME)/ca.crt
           env:
             - name: POD_IP
               valueFrom:
@@ -53,6 +58,16 @@ spec:
               port: redis
             initialDelaySeconds: 5
             periodSeconds: 5
+          volumeMounts:
+            - name: tls-0
+              mountPath: /etc/tls/hapartition-0
+              readOnly: true
+            - name: tls-1
+              mountPath: /etc/tls/hapartition-1
+              readOnly: true
+            - name: tls-2
+              mountPath: /etc/tls/hapartition-2
+              readOnly: true
           resources:
             requests:
               memory: 64Mi
@@ -60,4 +75,14 @@ spec:
             limits:
               memory: 128Mi
               cpu: 500m
+      volumes:
+        - name: tls-0
+          secret:
+            secretName: hapartition-0-tls
+        - name: tls-1
+          secret:
+            secretName: hapartition-1-tls
+        - name: tls-2
+          secret:
+            secretName: hapartition-2-tls
       terminationGracePeriodSeconds: 30

@@ -1,0 +1,61 @@
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: internal-ca
+spec:
+  ca:
+    secretName: internal-ca
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: hapartition-0
+  namespace: hapartition
+spec:
+  secretName: hapartition-0-tls
+  commonName: hapartition-0
+  dnsNames:
+    - hapartition-0.hapartition.svc.cluster.local
+    - hapartition-0.hapartition-gossip.hapartition.svc.cluster.local
+  issuerRef:
+    name: internal-ca
+    kind: ClusterIssuer
+  usages:
+    - server auth
+    - client auth
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: hapartition-1
+  namespace: hapartition
+spec:
+  secretName: hapartition-1-tls
+  commonName: hapartition-1
+  dnsNames:
+    - hapartition-1.hapartition.svc.cluster.local
+    - hapartition-1.hapartition-gossip.hapartition.svc.cluster.local
+  issuerRef:
+    name: internal-ca
+    kind: ClusterIssuer
+  usages:
+    - server auth
+    - client auth
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: hapartition-2
+  namespace: hapartition
+spec:
+  secretName: hapartition-2-tls
+  commonName: hapartition-2
+  dnsNames:
+    - hapartition-2.hapartition.svc.cluster.local
+    - hapartition-2.hapartition-gossip.hapartition.svc.cluster.local
+  issuerRef:
+    name: internal-ca
+    kind: ClusterIssuer
+  usages:
+    - server auth
+    - client auth
