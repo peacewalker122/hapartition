@@ -22,40 +22,119 @@ redis-cli -p 6379 GET mykey
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  redis-cli -p 6379 SET key value                     │
-└──────────────┬──────────────────────────────────────┘
-               │ RESP over TCP
-               ▼
-┌─────────────────────────────┐
-│  internal/server (TCP)      │
-│  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─  │
-│  1. hashring.GetNode(key)   │
-│  2. MOVED if remote         │
-│  3. store.Set(key, value)   │← assigns monotonic version
-│  4. gossip.Broadcast()      │← (key, value, version) via protobuf
-└──────────────┬──────────────┘
-               │ memberlist gossip
-               ▼
-┌─────────────────────────────┐
-│  internal/gossip            │
-│  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─  │
-│  Broadcast → every node     │
-│    → check GetReplicas()    │← "am I a replica?"
-│    → store.SetWithVersion() │← LWW merge
-│                             │
-│  Anti-entropy (30s)         │
-│    → pick random peer       │
-│    → exchange StoreSnapshot │
-│    → merge with LWW         │
-└─────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  redis-cli  │  curl /info  │  (other nodes) gossiping            │
+└──────┬───────────┬──────────────────────┬───────────────────────┘
+       │           │                      │
+       │ TCP:6379  │ HTTP:8080            │ memberlist (TCP+UDP:7946)
+       ▼           ▼                      ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                     cmd/hapartition/main.go                         │
+│  parses flags → wires modules → handles SIGINT/SIGTERM shutdown     │
+│  ┌──────────────┐  ┌────────────┐  ┌───────────────────────────┐  │
+│  │internal/     │  │internal/   │  │internal/                  │  │
+│  │server        │  │gossip      │  │mgmt                      │  │
+│  │              │  │            │  │                           │  │
+│  │ RESP parser  │  │ memberlist │  │ GET /        dashboard   │  │
+│  │ dispatch     │◄─┤ broadcast  │  │ GET /info    JSON members │  │
+│  │ hashring     │  │ anti-entropy│ │ GET /ring    hash viz    │  │
+│  │ MOVED        │  │ mTLS        │  │ GET /events  event log   │  │
+│  │              │  │            │  │ GET /events/  SSE stream │  │
+│  │              │  │            │  │   stream                 │  │
+│  │              │  │            │  │ POST /join   seed addr   │  │
+│  └──────┬───────┘  └──────┬─────┘  └───────────────────────────┘  │
+│         │                 │                                        │
+│         ▼                 ▼                                        │
+│  ┌──────────────────────────────────────────────────────────┐     │
+│  │ pkg/store                                                │     │
+│  │  in-memory KV with monotonic versioning, LWW merge       │     │
+│  │  Set(key, val) → assigns version                         │     │
+│  │  SetWithVersion(key, val, ver) → LWW compare             │     │
+│  │  Snapshot() → full dump for anti-entropy exchange        │     │
+│  └──────────────────────────────────────────────────────────┘     │
+│         ▲                                                        │
+│         │                                                        │
+│  ┌──────┴───────┐                                                │
+│  │ pkg/api      │                                                │
+│  │  RESP reader │                                                │
+│  │  RESP writer │                                                │
+│  └──────────────┘                                                │
+└─────────────────────────────────────────────────────────────────────┘
 
-┌─────────────────────────────┐
-│  HTTP /info via net/http    │
-│  returns cluster members    │
-│  with Redis & gossip addrs  │
-└─────────────────────────────┘
+│  internal/hashring                │
+│  consistent hash ring (Ketama)    │
+│  xxHash, 256 vnodes per node      │
+│  GetNode(key) → owner             │
+│  GetReplicas(key, n) → n replicas │
+│  GetSlotRanges() → CLUSTER SLOTS  │
+│  RingSnapshot() → /ring API       │
+└───────────────────────────────────┘
 ```
+
+## Module responsibilities
+
+### `cmd/hapartition/main.go` — Entry point
+
+Parses CLI flags, wires all modules together, loads TLS config, and handles
+`SIGINT`/`SIGTERM` orchestrated shutdown (HTTP first → gossip leave → Redis).
+
+### `internal/server` — Redis-compatible TCP server
+
+Listens on the Redis port, parses RESP protocol via `pkg/api`, dispatches
+commands:
+- **Key commands** (`SET`/`GET`/`DEL`) → hash ring lookup → local store or
+  `MOVED` redirection
+- **Cluster commands** (`CLUSTER SLOTS`/`NODES`/`INFO`/`KEYSLOT`) → ring
+  introspection for cluster-aware Redis clients
+- **Node commands** (`NODE.LIST`/`NODE.JOIN`) — direct cluster management
+
+### `internal/gossip` — Memberlist wrapper
+
+SWIM gossip via HashiCorp Memberlist. Handles:
+- **Broadcast** — when a key is written, serializes `(key, value, version)` as
+  protobuf and fan-out to all cluster members
+- **Replication** — on receive, checks `hashring.GetReplicas()` to decide if
+  this node is a replica; applies LWW merge via `store.SetWithVersion()`
+- **Anti-entropy** — every 30s picks a random peer, exchanges full store
+  snapshot, merges with LWW. Catches writes missed during partitions
+- **Membership** — `NotifyJoin`/`NotifyLeave` callbacks update the hash ring
+- **mTLS** — optional TLS transport for gossip traffic with peer verification
+
+### `internal/mgmt` — HTTP management server
+
+Serves alongside the Redis port on a separate listener:
+- `GET /` — embedded dashboard HTML (`dashboard.html`) with hash ring
+  visualization, live event log via SSE
+- `GET /info` — JSON node info, members, key count
+- `GET /ring` — hash ring snapshot (hex hashes per virtual node)
+- `GET /events` — recent cluster events as JSON
+- `GET /events/stream` — Server-Sent Events stream for real-time UI updates
+- `POST /join` — request to join a gossip seed address
+
+### `internal/hashring` — Consistent hash ring
+
+Ketama-style ring with 256 virtual nodes per physical node and xxHash.
+Binary search lookup for O(log N) key → node mapping. Supports:
+- `GetNode(key)` — owner of a key
+- `GetReplicas(key, n)` — next n distinct nodes clockwise (for replication)
+- `GetSlotRanges()` — slot ranges per node for `CLUSTER SLOTS`
+- `RingSnapshot()` — full sorted ring for dashboard visualization
+
+### `pkg/store` — Versioned KV store
+
+In-memory key-value store with:
+- `Set(key, value)` — assigns a monotonic version counter
+- `SetWithVersion(key, value, version)` — LWW merge: rejects if stored version
+  ≥ incoming version
+- `Snapshot()` — full dump for anti-entropy exchange
+- `Del(key)` — local deletion (not replicated)
+
+### `pkg/api` — RESP protocol
+
+Reader and writer for the Redis Serialization Protocol:
+- `Reader` — parses `+OK`, `-ERR`, `:42`, `$6\r\nfoobar\r\n`, `*2\r\n...`,
+  and inline commands
+- `Writer` — serialises RESP values to the wire
 
 ## Quick start
 
@@ -119,6 +198,21 @@ redis-cli -p 6380 SET mykey value
 | `--gossip-port` | `7946` | Memberlist gossip port (TCP+UDP) |
 | `--join` | `""` | Comma-separated gossip seed addresses (`host:port`) |
 | `--rf` | `2` | Replication factor (number of replicas per key) |
+| `--tls-cert` | `""` | TLS certificate file for mTLS gossip |
+| `--tls-key` | `""` | TLS private key file for mTLS gossip |
+| `--tls-ca` | `""` | CA certificate file for verifying peer certs (falls back to system pool) |
+| `--tls-insecure` | `false` | Skip peer certificate verification (self-signed dev certs) |
+
+### TLS / mTLS
+
+When `--tls-cert` and `--tls-key` are set, gossip traffic uses mutual TLS. Each
+node presents its certificate; peers verify against the CA in `--tls-ca`. If
+`--tls-insecure` is set, peer verification is skipped (useful with self-signed
+certs in development).
+
+The node cert's SAN must include a `ServerName` value of `"hapartition"` — the
+cluster sets this on every peer connection so hostname verification passes even
+when connecting by IP.
 
 ### Discovery abstractions
 
@@ -143,6 +237,35 @@ func (d *DNSDiscoverer) Discover() ([]string, error) {
     // ... append port and return
 }
 ```
+
+## Kubernetes deployment
+
+The `deploy/k3s/` directory contains manifests for running on k3s or any
+Kubernetes cluster with cert-manager:
+
+| File | Purpose |
+|------|---------|
+| `namespace.yaml` | `hapartition` namespace |
+| `service.yaml` | Headless gossip service + NodePort Redis/HTTP |
+| `ca-bootstrap.yaml` | SelfSigned issuer + CA certificate bootstrap |
+| `certs.yaml` | Per-node TLS certificates (cert-manager) |
+| `deployment.yaml` | StatefulSet with per-node cert mounts |
+
+Apply in order:
+
+```bash
+kubectl apply -f deploy/k3s/namespace.yaml
+kubectl apply -f deploy/k3s/ca-bootstrap.yaml
+# wait for ClusterIssuer/internal-ca to become Ready
+kubectl wait --for=condition=Ready clusterissuer/internal-ca --timeout=60s
+kubectl apply -f deploy/k3s/certs.yaml
+kubectl apply -f deploy/k3s/service.yaml
+kubectl apply -f deploy/k3s/deployment.yaml
+```
+
+Each pod gets its own TLS certificate from cert-manager, mounted at
+`/etc/tls/<pod-name>/`. Gossip traffic uses mTLS with `--tls-insecure` for
+self-signed CA (see [TLS / mTLS](#tls--mtls)).
 
 ## How it works
 
@@ -175,6 +298,17 @@ Memberlist handles all cluster membership:
 - **Leave** — graceful shutdown via `SIGINT`/`SIGTERM`
 - The hashring updates automatically on `NotifyJoin` and `NotifyLeave` events
 
+### HTTP management API
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/` | GET | Cluster dashboard (HTML with hashring viz, SSE event log) |
+| `/info` | GET | Node ID, key count, member list |
+| `/ring` | GET | Hash ring snapshot (hex hashes, node assignments) |
+| `/events` | GET | Recent cluster events (join, leave, key changes) |
+| `/events/stream` | GET | Server-sent events (real-time cluster updates) |
+| `/join` | POST | Join a gossip seed (`{"address":"host:port"}`) |
+
 ## Project structure
 
 ```
@@ -200,6 +334,11 @@ cmd/hapartition/main.go     Entry point — flags, gossip setup, signal handling
 | `SET key value` | ✓ | Async replication to cluster |
 | `GET key` | ✓ | Returns value or nil |
 | `DEL key [key ...]` | ✓ | Local only (no replication) |
+| `INFO` | ✓ | Redis-compatible server info |
+| `CLUSTER SLOTS` | ✓ | Slot-to-node mapping for cluster-aware clients |
+| `CLUSTER NODES` | ✓ | Node list with IDs and addresses |
+| `CLUSTER INFO` | ✓ | Cluster state summary |
+| `CLUSTER KEYSLOT key` | ✓ | Hash slot for a key |
 | `NODE.JOIN key address` | ✓ | Adds node to hashring (doesn't affect gossip membership — use `--join` for that) |
 | `NODE.LIST` | ✓ | Returns memberlist nodes and Redis addresses |
 | `NODE.PING` | ✗ | Deprecated — memberlist handles health checks |
@@ -213,7 +352,15 @@ go test -race -count=1 ./...
 go vet ./...
 ```
 
-All tests pass under `-race`.
+All tests pass under `-race`. Integration tests use [Testcontainers](https://testcontainers.com/) to spin up a real Redis instance for cross-validation. Benchmarks cover single-node and cluster workloads.
+
+```bash
+# unit + integration + race
+go test -race -count=1 ./...
+
+# benchmarks
+go test -bench=. -benchmem ./...
+```
 
 ### Adding a discovery backend
 
