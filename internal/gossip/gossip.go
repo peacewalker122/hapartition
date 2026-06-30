@@ -2,12 +2,10 @@ package gossip
 
 import (
 	"crypto/tls"
-	"fmt"
 	"log"
 	"sync"
 	"time"
 
-	"github.com/hashicorp/memberlist"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/peacewalker122/hapartition/internal/gossip/pb"
@@ -75,7 +73,7 @@ func (r *eventRing) Recent(n int) []ClusterEvent {
 
 // Config for the gossip layer.
 type Config struct {
-	NodeID         string            // unique node ID (memberlist Name)
+	NodeID         string            // unique node ID
 	BindAddr       string            // gossip bind address (e.g. "0.0.0.0")
 	BindPort       int               // gossip bind port
 	AdvertiseAddr  string            // optional, for NAT
@@ -85,16 +83,16 @@ type Config struct {
 	ReplicaRF      int               // replication factor (number of replicas per key)
 	Discoverer     Discoverer        // seed discovery
 	AntiEntropySec int               // anti-entropy interval in seconds (default 30)
-	TLSConfig      *tls.Config       // optional mTLS config for gossip TCP streams
+	TLSConfig      *tls.Config       // optional mTLS config
+	Transport      GossipTransport   // transport impl (nil = memberlist)
+	Clock          Clock             // clock impl (nil = wall clock)
 }
 
-// Handler wraps memberlist and implements the Delegate + EventDelegate for
-// data replication via gossip.
+// Handler wraps a GossipTransport and implements data replication via gossip.
 type Handler struct {
 	cfg        Config
-	memberlist *memberlist.Memberlist
-	delegate   *gossipDelegate
-	broadcasts *memberlist.TransmitLimitedQueue
+	transport  GossipTransport
+	clock      Clock
 	stopCh     chan struct{}
 
 	events    *eventRing
@@ -138,53 +136,53 @@ func (h *Handler) RecentEvents(n int) []ClusterEvent {
 
 // New creates a gossip handler. Call Start() to begin.
 func New(cfg Config) *Handler {
+	// Default transport is memberlist if none set.
+	transport := cfg.Transport
+	if transport == nil {
+		transport = NewMemberlistTransport()
+	}
+
+	clock := cfg.Clock
+	if clock == nil {
+		clock = wallClock{}
+	}
+
 	return &Handler{
 		cfg:         cfg,
-		delegate:    &gossipDelegate{},
+		transport:   transport,
+		clock:       clock,
 		stopCh:      make(chan struct{}),
 		events:      newEventRing(eventRingSize),
 		subscribers: make(map[int]chan ClusterEvent),
 	}
 }
 
-// Start initialises memberlist and joins the cluster.
+// Start initialises the transport and joins the cluster.
 func (h *Handler) Start() error {
 	if h.cfg.AntiEntropySec <= 0 {
 		h.cfg.AntiEntropySec = 30
 	}
 
-	h.delegate.handler = h
+	// Set up callbacks from transport → gossip handler
+	h.transport.SetHandlers(TransportHandlers{
+		OnMessage:         h.handleMessage,
+		OnJoin:            h.handleJoin,
+		OnLeave:           h.handleLeave,
+		OnUpdate:          h.handleUpdate,
+		OnLocalState:      h.handleLocalState,
+		OnMergeRemoteState: h.handleMergeRemoteState,
+	})
 
-	cfg := memberlist.DefaultLANConfig()
-	cfg.Name = h.cfg.NodeID
-	cfg.BindAddr = h.cfg.BindAddr
-	cfg.BindPort = h.cfg.BindPort
-	if h.cfg.AdvertiseAddr != "" {
-		cfg.AdvertiseAddr = h.cfg.AdvertiseAddr
+	// Start the transport (binds ports, creates memberlist, etc.)
+	tCfg := TransportConfig{
+		NodeID:    h.cfg.NodeID,
+		BindAddr:  h.cfg.BindAddr,
+		BindPort:  h.cfg.BindPort,
+		RedisAddr: h.cfg.RedisAddr,
+		TLSConfig: h.cfg.TLSConfig,
 	}
-	cfg.Delegate = h.delegate
-	cfg.Events = h.delegate
-	cfg.LogOutput = log.Default().Writer()
-	cfg.EnableCompression = true
-
-	if h.cfg.TLSConfig != nil {
-		tlsTransport, err := NewTLSTransport(cfg, h.cfg.TLSConfig, log.Default())
-		if err != nil {
-			return fmt.Errorf("gossip: create tls transport: %w", err)
-		}
-		cfg.Transport = tlsTransport
-	}
-
-	list, err := memberlist.Create(cfg)
-	if err != nil {
-		return fmt.Errorf("gossip: create memberlist: %w", err)
-	}
-	h.memberlist = list
-
-	// Broadcast queue
-	h.broadcasts = &memberlist.TransmitLimitedQueue{
-		NumNodes:       func() int { return list.NumMembers() },
-		RetransmitMult: 3,
+	if err := h.transport.Start(tCfg); err != nil {
+		return err
 	}
 
 	// Join the cluster via discoverer
@@ -193,7 +191,7 @@ func (h *Handler) Start() error {
 		if err != nil {
 			log.Printf("gossip: discover seeds: %v (will retry in background)", err)
 		} else if len(seeds) > 0 {
-			_, err := list.Join(seeds)
+			_, err := h.transport.Join(seeds)
 			if err != nil {
 				log.Printf("gossip: initial join %v: %v (will retry in background)", seeds, err)
 			} else {
@@ -201,8 +199,6 @@ func (h *Handler) Start() error {
 			}
 		}
 		// Retry join in background until we see at least one peer.
-		// This handles the K8s bootstrapping case where all pods start
-		// simultaneously and the headless service DNS returns nothing yet.
 		go h.retryJoin(seeds)
 	}
 
@@ -212,13 +208,80 @@ func (h *Handler) Start() error {
 	return nil
 }
 
-// retryJoin keeps trying to join seeds until we see at least one peer.
+// --- transport callbacks ---
+
+func (h *Handler) handleMessage(from string, buf []byte) {
+	var batch pb.EntryBatch
+	if err := proto.Unmarshal(buf, &batch); err != nil {
+		log.Printf("gossip: unmarshal message: %v", err)
+		return
+	}
+	h.HandleReplication(batch.Entries)
+}
+
+func (h *Handler) handleJoin(nodeID, redisAddr string) {
+	h.cfg.Ring.AddNode(nodeID, redisAddr, 256)
+	h.PushEvent(ClusterEvent{
+		Timestamp: h.clock.Now(),
+		Type:      "join",
+		NodeName:  nodeID,
+		RedisAddr: redisAddr,
+	})
+	log.Printf("gossip: node joined: %s (%s)", nodeID, redisAddr)
+}
+
+func (h *Handler) handleLeave(nodeID string) {
+	h.cfg.Ring.RemoveNode(nodeID)
+	h.PushEvent(ClusterEvent{
+		Timestamp: h.clock.Now(),
+		Type:      "leave",
+		NodeName:  nodeID,
+	})
+	log.Printf("gossip: node left: %s", nodeID)
+}
+
+func (h *Handler) handleUpdate(nodeID, redisAddr string) {
+	h.PushEvent(ClusterEvent{
+		Timestamp: h.clock.Now(),
+		Type:      "update",
+		NodeName:  nodeID,
+		RedisAddr: redisAddr,
+	})
+}
+
+func (h *Handler) handleLocalState() []byte {
+	snapshot := h.serializeStore()
+	if snapshot == nil {
+		return nil
+	}
+	buf, err := proto.Marshal(snapshot)
+	if err != nil {
+		log.Printf("gossip: marshal local state: %v", err)
+		return nil
+	}
+	return buf
+}
+
+func (h *Handler) handleMergeRemoteState(buf []byte) {
+	var snapshot pb.EntryBatch
+	if err := proto.Unmarshal(buf, &snapshot); err != nil {
+		log.Printf("gossip: unmarshal remote state: %v", err)
+		return
+	}
+	for _, e := range snapshot.Entries {
+		h.cfg.Store.SetWithVersion(e.Key, e.Value, e.Version)
+	}
+	log.Printf("gossip: merged %d entries from anti-entropy", len(snapshot.Entries))
+}
+
+// --- retry join ---
+
 func (h *Handler) retryJoin(seeds []string) {
 	if len(seeds) == 0 {
 		return
 	}
 	// If we already have peers on first try, nothing to do.
-	if h.memberlist.NumMembers() > 1 {
+	if len(h.transport.Members()) > 1 {
 		return
 	}
 	ticker := time.NewTicker(5 * time.Second)
@@ -228,7 +291,7 @@ func (h *Handler) retryJoin(seeds []string) {
 		case <-h.stopCh:
 			return
 		case <-ticker.C:
-			if h.memberlist.NumMembers() > 1 {
+			if len(h.transport.Members()) > 1 {
 				return
 			}
 			seeds, err := h.cfg.Discoverer.Discover()
@@ -239,7 +302,7 @@ func (h *Handler) retryJoin(seeds []string) {
 			if len(seeds) == 0 {
 				continue
 			}
-			_, err = h.memberlist.Join(seeds)
+			_, err = h.transport.Join(seeds)
 			if err == nil {
 				log.Printf("gossip: joined cluster via retry")
 				return
@@ -257,49 +320,22 @@ func (h *Handler) Broadcast(key, value string, version int64) {
 		log.Printf("gossip: marshal broadcast: %v", err)
 		return
 	}
-
-	// Find how many retransmissions we need (at least 2 for RF=2)
-	numRetransmits := h.cfg.ReplicaRF
-	if numRetransmits < 2 {
-		numRetransmits = 2
-	}
-
-	h.broadcasts.QueueBroadcast(&broadcastMessage{
-		buf:  buf,
-		name: key,
-	})
+	h.transport.Broadcast(buf, key)
 }
 
-// NodeID returns this node's memberlist name.
+// NodeID returns this node's ID.
 func (h *Handler) NodeID() string {
-	if h.memberlist == nil {
-		return h.cfg.NodeID
-	}
-	return h.memberlist.LocalNode().Name
-}
-
-// Members returns all known cluster members.
-func (h *Handler) Members() []*memberlist.Node {
-	if h.memberlist == nil {
-		return nil
-	}
-	return h.memberlist.Members()
+	return h.transport.LocalNodeID()
 }
 
 // Leave gracefully leaves the cluster.
 func (h *Handler) Leave(timeout time.Duration) error {
 	close(h.stopCh)
-	if h.memberlist == nil {
-		return nil
-	}
-	if err := h.memberlist.Leave(timeout); err != nil {
-		return err
-	}
-	return h.memberlist.Shutdown()
+	return h.transport.Leave(timeout)
 }
 
-// HandleReplication is called by the server when it receives a replication
-// message. Public so the server can expose it via tests.
+// HandleReplication is called when the server receives a replication message.
+// Public so the server can expose it via tests.
 func (h *Handler) HandleReplication(entries []*pb.Entry) {
 	for _, e := range entries {
 		replicas := h.cfg.Ring.GetReplicas(e.Key, h.cfg.ReplicaRF)
@@ -313,7 +349,6 @@ func (h *Handler) HandleReplication(entries []*pb.Entry) {
 		if !isReplica {
 			continue
 		}
-		// LWW — SetWithVersion skips if existing version >= incoming
 		h.cfg.Store.SetWithVersion(e.Key, e.Value, e.Version)
 	}
 }
@@ -321,45 +356,41 @@ func (h *Handler) HandleReplication(entries []*pb.Entry) {
 // --- anti-entropy ---
 
 func (h *Handler) antiEntropyLoop() {
-	ticker := time.NewTicker(time.Duration(h.cfg.AntiEntropySec) * time.Second)
-	defer ticker.Stop()
-
+	// Re-arm After each tick — works for both wallClock (time.After creates a
+	// new timer) and ManualClock (channel fires on Advance).
 	for {
 		select {
 		case <-h.stopCh:
 			return
-		case <-ticker.C:
+		case <-h.clock.After(time.Duration(h.cfg.AntiEntropySec) * time.Second):
 			h.exchangeState()
 		}
 	}
 }
 
 func (h *Handler) exchangeState() {
-	// Serialize entire store
 	snapshot := h.serializeStore()
 	if snapshot == nil {
 		return
 	}
 
-	// Pick a random peer
-	members := h.memberlist.Members()
+	members := h.transport.Members()
 	if len(members) <= 1 {
-		return // only us
+		return
 	}
 
 	// Exclude self
-	peers := make([]memberlist.Node, 0, len(members)-1)
+	var peers []MemberInfo
 	for _, m := range members {
 		if m.Name != h.NodeID() {
-			peers = append(peers, *m)
+			peers = append(peers, m)
 		}
 	}
 	if len(peers) == 0 {
 		return
 	}
 
-	// Pick the first (we could randomize, but for simplicity just sync with
-	// one peer each round — over time all nodes converge)
+	// Pick the first peer for this round
 	peer := peers[0]
 	snapshotBuf, err := proto.Marshal(snapshot)
 	if err != nil {
@@ -367,8 +398,7 @@ func (h *Handler) exchangeState() {
 		return
 	}
 
-	// Use reliable send for anti-entropy
-	if err := h.memberlist.SendReliable(&peer, snapshotBuf); err != nil {
+	if err := h.transport.SendReliable(peer.Name, snapshotBuf); err != nil {
 		log.Printf("gossip: anti-entropy send to %s: %v", peer.Name, err)
 	}
 }
@@ -389,122 +419,6 @@ func (h *Handler) serializeStore() *pb.EntryBatch {
 	return &pb.EntryBatch{Entries: entries}
 }
 
-// --- memberlist Delegate ---
-
-// gossipDelegate implements memberlist.Delegate, memberlist.EventDelegate.
-type gossipDelegate struct {
-	handler *Handler
-}
-
-// NodeMeta encodes our Redis address into memberlist node metadata.
-func (d *gossipDelegate) NodeMeta(limit int) []byte {
-	meta := &pb.NodeMeta{RedisAddr: d.handler.cfg.RedisAddr}
-	buf, err := proto.Marshal(meta)
-	if err != nil {
-		return nil
-	}
-	if len(buf) > limit {
-		log.Printf("gossip: NodeMeta %d bytes exceeds limit %d", len(buf), limit)
-		return buf[:limit]
-	}
-	return buf
-}
-
-// NotifyMsg handles an incoming gossip message (broadcast or anti-entropy).
-func (d *gossipDelegate) NotifyMsg(msg []byte) {
-	var batch pb.EntryBatch
-	if err := proto.Unmarshal(msg, &batch); err != nil {
-		log.Printf("gossip: unmarshal message: %v", err)
-		return
-	}
-	d.handler.HandleReplication(batch.Entries)
-}
-
-// GetBroadcasts pulls pending broadcasts from the queue.
-func (d *gossipDelegate) GetBroadcasts(overhead, limit int) [][]byte {
-	return d.handler.broadcasts.GetBroadcasts(overhead, limit)
-}
-
-// LocalState serializes the current store for memberlist's anti-entropy.
-func (d *gossipDelegate) LocalState(join bool) []byte {
-	snapshot := d.handler.serializeStore()
-	if snapshot == nil {
-		return nil
-	}
-	buf, err := proto.Marshal(snapshot)
-	if err != nil {
-		log.Printf("gossip: marshal local state: %v", err)
-		return nil
-	}
-	return buf
-}
-
-// MergeRemoteState merges incoming anti-entropy state from a peer.
-func (d *gossipDelegate) MergeRemoteState(buf []byte, join bool) {
-	var snapshot pb.EntryBatch
-	if err := proto.Unmarshal(buf, &snapshot); err != nil {
-		log.Printf("gossip: unmarshal remote state: %v", err)
-		return
-	}
-	// LWW merge all entries
-	for _, e := range snapshot.Entries {
-		d.handler.cfg.Store.SetWithVersion(e.Key, e.Value, e.Version)
-	}
-	log.Printf("gossip: merged %d entries from anti-entropy", len(snapshot.Entries))
-}
-
-// --- EventDelegate ---
-
-// NotifyJoin is called when a new node joins the cluster.
-func (d *gossipDelegate) NotifyJoin(node *memberlist.Node) {
-	redisAddr := DecodeMetaRedisAddr(node.Meta)
-	if redisAddr == "" {
-		redisAddr = node.Addr.String()
-	}
-	d.handler.cfg.Ring.AddNode(node.Name, redisAddr, 256)
-	d.handler.PushEvent(ClusterEvent{
-		Timestamp: time.Now(),
-		Type:      "join",
-		NodeName:  node.Name,
-		Address:   node.Addr.String(),
-		RedisAddr: redisAddr,
-	})
-	log.Printf("gossip: node joined: %s (%s)", node.Name, redisAddr)
-}
-
-// NotifyLeave is called when a node leaves the cluster.
-func (d *gossipDelegate) NotifyLeave(node *memberlist.Node) {
-	d.handler.cfg.Ring.RemoveNode(node.Name)
-	d.handler.PushEvent(ClusterEvent{
-		Timestamp: time.Now(),
-		Type:      "leave",
-		NodeName:  node.Name,
-		Address:   node.Addr.String(),
-		RedisAddr: DecodeMetaRedisAddr(node.Meta),
-	})
-	log.Printf("gossip: node left: %s", node.Name)
-}
-
-// NotifyUpdate is called when a node's metadata changes.
-func (d *gossipDelegate) NotifyUpdate(node *memberlist.Node) {
-	redisAddr := DecodeMetaRedisAddr(node.Meta)
-	d.handler.PushEvent(ClusterEvent{
-		Timestamp: time.Now(),
-		Type:      "update",
-		NodeName:  node.Name,
-		Address:   node.Addr.String(),
-		RedisAddr: redisAddr,
-	})
-}
-
-// MemberInfo holds a summary of a cluster member for external consumers.
-type MemberInfo struct {
-	Name      string
-	RedisAddr string
-	Addr      string
-	Status    string // alive, suspect, dead, left
-}
-
 // KeyCount returns the number of keys in the local store.
 func (h *Handler) KeyCount() int {
 	return h.cfg.Store.Len()
@@ -517,32 +431,7 @@ func (h *Handler) Ring() hashring.Hashring {
 
 // MembersInfo returns all cluster members with their decoded Redis addresses.
 func (h *Handler) MembersInfo() []MemberInfo {
-	if h.memberlist == nil {
-		return nil
-	}
-	members := h.memberlist.Members()
-	info := make([]MemberInfo, len(members))
-	for i, m := range members {
-		status := "alive"
-		switch m.State {
-		case memberlist.StateSuspect:
-			status = "suspect"
-		case memberlist.StateDead:
-			status = "dead"
-		case memberlist.StateLeft:
-			status = "left"
-		}
-		info[i] = MemberInfo{
-			Name:      m.Name,
-			Addr:      m.Addr.String(),
-			RedisAddr: DecodeMetaRedisAddr(m.Meta),
-			Status:    status,
-		}
-		if info[i].RedisAddr == "" {
-			info[i].RedisAddr = m.Addr.String()
-		}
-	}
-	return info
+	return h.transport.Members()
 }
 
 // DecodeMetaRedisAddr extracts the Redis address from memberlist node metadata.
@@ -555,28 +444,4 @@ func DecodeMetaRedisAddr(meta []byte) string {
 		return ""
 	}
 	return nm.RedisAddr
-}
-
-// --- broadcastMessage implements memberlist.Broadcast ---
-
-type broadcastMessage struct {
-	buf  []byte
-	name string
-}
-
-func (b *broadcastMessage) Invalidates(other memberlist.Broadcast) bool {
-	// Invalidate older broadcast for the same key
-	o, ok := other.(*broadcastMessage)
-	if !ok {
-		return false
-	}
-	return b.name == o.name
-}
-
-func (b *broadcastMessage) Message() []byte {
-	return b.buf
-}
-
-func (b *broadcastMessage) Finished() {
-	// no-op — nothing to clean up
 }

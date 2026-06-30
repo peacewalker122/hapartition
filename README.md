@@ -21,54 +21,86 @@ redis-cli -p 6379 GET mykey
 
 ## Architecture
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│  redis-cli  │  curl /info  │  (other nodes) gossiping            │
-└──────┬───────────┬──────────────────────┬───────────────────────┘
-       │           │                      │
-       │ TCP:6379  │ HTTP:8080            │ memberlist (TCP+UDP:7946)
-       ▼           ▼                      ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                     cmd/hapartition/main.go                         │
-│  parses flags → wires modules → handles SIGINT/SIGTERM shutdown     │
-│  ┌──────────────┐  ┌────────────┐  ┌───────────────────────────┐  │
-│  │internal/     │  │internal/   │  │internal/                  │  │
-│  │server        │  │gossip      │  │mgmt                      │  │
-│  │              │  │            │  │                           │  │
-│  │ RESP parser  │  │ memberlist │  │ GET /        dashboard   │  │
-│  │ dispatch     │◄─┤ broadcast  │  │ GET /info    JSON members │  │
-│  │ hashring     │  │ anti-entropy│ │ GET /ring    hash viz    │  │
-│  │ MOVED        │  │ mTLS        │  │ GET /events  event log   │  │
-│  │              │  │            │  │ GET /events/  SSE stream │  │
-│  │              │  │            │  │   stream                 │  │
-│  │              │  │            │  │ POST /join   seed addr   │  │
-│  └──────┬───────┘  └──────┬─────┘  └───────────────────────────┘  │
-│         │                 │                                        │
-│         ▼                 ▼                                        │
-│  ┌──────────────────────────────────────────────────────────┐     │
-│  │ pkg/store                                                │     │
-│  │  in-memory KV with monotonic versioning, LWW merge       │     │
-│  │  Set(key, val) → assigns version                         │     │
-│  │  SetWithVersion(key, val, ver) → LWW compare             │     │
-│  │  Snapshot() → full dump for anti-entropy exchange        │     │
-│  └──────────────────────────────────────────────────────────┘     │
-│         ▲                                                        │
-│         │                                                        │
-│  ┌──────┴───────┐                                                │
-│  │ pkg/api      │                                                │
-│  │  RESP reader │                                                │
-│  │  RESP writer │                                                │
-│  └──────────────┘                                                │
-└─────────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    subgraph External["External"]
+        Client["redis-cli / haproxy"]
+        HTTP["curl / browser"]
+        Peer["peer node (gossip)"]
+    end
 
-│  internal/hashring                │
-│  consistent hash ring (Ketama)    │
-│  xxHash, 256 vnodes per node      │
-│  GetNode(key) → owner             │
-│  GetReplicas(key, n) → n replicas │
-│  GetSlotRanges() → CLUSTER SLOTS  │
-│  RingSnapshot() → /ring API       │
-└───────────────────────────────────┘
+    subgraph Main["cmd/hapartition/main.go"]
+        M_Setup["parses flags, wires modules, TLS config"]
+        M_Shutdown["SIGINT/SIGTERM → orderly shutdown"]
+    end
+
+    subgraph Server["internal/server"]
+        S_Listen["TCP listener :6379"]
+        S_RESP["RESP parser (pkg/api)"]
+        S_Dispatch["command dispatcher"]
+        S_Cluster["CLUSTER SLOTS / NODES / INFO / KEYSLOT"]
+    end
+
+    subgraph HashRing["internal/hashring"]
+        H_Add["AddNode / RemoveNode"]
+        H_Get["GetNode(key) → owner"]
+        H_Replicas["GetReplicas(key, n) → n replicas"]
+        H_Slots["GetSlotRanges()"]
+        H_Snap["RingSnapshot()"]
+    end
+
+    subgraph Store["pkg/store"]
+        S_Set["Set(key, val) → version"]
+        S_LWW["SetWithVersion(key, val, ver) → LWW compare"]
+        S_Get["Get(key) → val"]
+        S_Snap["Snapshot() → full dump"]
+    end
+
+    subgraph Gossip["internal/gossip"]
+        G_Mlist["memberlist SWIM"]
+        G_Bcast["Broadcast (key, val, version)"]
+        G_Replic["HandleReplication → store.SetWithVersion"]
+        G_AE["AntiEntropy (30s loop)"]
+        G_Membership["NotifyJoin / NotifyLeave → hashring update"]
+        G_mTLS["mTLS gossip transport"]
+        G_Events["ClusterEvent ring buffer / SSE"]
+    end
+
+    subgraph Mgmt["internal/mgmt"]
+        M_Dash["GET / → dashboard HTML"]
+        M_Info["GET /info → JSON"]
+        M_Ring["GET /ring → hash viz"]
+        M_Events["GET /events → recent events"]
+        M_SSE["GET /events/stream → SSE"]
+        M_Join["POST /join → seed address"]
+    end
+
+    Client -->|TCP:6379| S_Listen
+    HTTP -->|TCP:8080| M_Dash
+    HTTP -->|TCP:8080| M_Info
+    HTTP -->|TCP:8080| M_Ring
+    HTTP -->|TCP:8080| M_Events
+    HTTP -->|TCP:8080| M_SSE
+    HTTP -->|TCP:8080| M_Join
+    Peer -->|memberlist:7946| G_Mlist
+
+    S_Listen --> S_RESP
+    S_RESP --> S_Dispatch
+    S_Dispatch --> H_Get
+    S_Dispatch --> H_Slots
+    S_Dispatch --> S_Cluster
+    H_Get --> S_Set
+    S_Set --> G_Bcast
+    G_Bcast --> G_Mlist
+    G_Mlist --> Peer
+    Peer --> G_Mlist
+    G_Mlist --> G_Replic
+    G_Replic --> S_LWW
+    G_AE --> G_Mlist
+    G_Membership --> H_Add
+    G_Events --> M_Events
+    G_Events --> M_SSE
+    H_Snap --> M_Ring
 ```
 
 ## Module responsibilities
