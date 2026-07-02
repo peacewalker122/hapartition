@@ -62,6 +62,25 @@ func (c *ManualClock) Advance(d time.Duration) {
 	c.mu.Unlock()
 }
 
+// WaitForPending blocks until at least n After() calls have been registered,
+// or timeout expires. Returns true if n pending entries were observed.
+func (c *ManualClock) WaitForPending(n int, timeout time.Duration) bool {
+	deadline := time.After(timeout)
+	for {
+		c.mu.Lock()
+		count := len(c.pending)
+		c.mu.Unlock()
+		if count >= n {
+			return true
+		}
+		select {
+		case <-deadline:
+			return false
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
 // ─── MessageBus ─────────────────────────────────────────────────────────────
 
 // Message is an in-flight message between simulated transports.
@@ -197,6 +216,7 @@ type simulatedTransport struct {
 	inbox     chan Message
 	handlers  TransportHandlers
 	started   bool
+	aeFired   chan struct{} // ponytail: signals SendReliable calls from AE goroutine
 }
 
 func newSimulatedTransport(nodeID, redisAddr string, bus *MessageBus) *simulatedTransport {
@@ -205,6 +225,7 @@ func newSimulatedTransport(nodeID, redisAddr string, bus *MessageBus) *simulated
 		redisAddr: redisAddr,
 		bus:       bus,
 		inbox:     make(chan Message, 256),
+		aeFired:   make(chan struct{}, 16),
 	}
 }
 
@@ -258,6 +279,11 @@ func (s *simulatedTransport) Members() []MemberInfo {
 
 func (s *simulatedTransport) SendReliable(nodeID string, buf []byte) error {
 	s.bus.queue(Message{From: s.nodeID, To: nodeID, Buf: cloneBytes(buf)})
+	// Signal that AE (or any reliable send) fired — used by triggerAE.
+	select {
+	case s.aeFired <- struct{}{}:
+	default:
+	}
 	return nil
 }
 
@@ -321,24 +347,31 @@ func startSimNode(t *testing.T, nodeID, redisAddr string, bus *MessageBus, clock
 }
 
 // triggerAE advances the clock past the anti-entropy interval to trigger
-// exchangeState on all nodes. Polls until AE goroutines have enqueued at
-// least one message per node onto the bus pending queue.
-func triggerAE(t *testing.T, nodes []*simNode, clock *ManualClock, bus *MessageBus) {
+// exchangeState on all nodes. Waits on explicit synchronization channels
+// (aeFired) instead of polling, eliminating the real-time race.
+func triggerAE(t *testing.T, nodes []*simNode, clock *ManualClock) {
 	t.Helper()
+
+	// Wait for AE goroutines to register their After() calls
+	if !clock.WaitForPending(len(nodes), 2*time.Second) {
+		t.Fatalf("triggerAE timeout: waiting for AE goroutines to register")
+	}
+
 	// Advance past the AE interval (default 30s). The AE goroutines' After
 	// channels fire, causing each to call exchangeState → SendReliable → bus.
 	clock.Advance(31 * time.Second)
 
-	// Poll until enough messages have been queued (one per node, minus self).
-	// The test may share pending with other messages, so we check that at
-	// least one new message appeared.
-	for i := 0; i < 100; i++ {
-		if bus.PendingCount() >= len(nodes) {
-			return
+	// Wait for each node's AE goroutine to call SendReliable.
+	// Each node picks one peer in exchangeState, so we expect one signal per
+	// node. Channels are buffered, so signals from goroutines that fire before
+	// we reach them are captured.
+	for i, n := range nodes {
+		select {
+		case <-n.transport.aeFired:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("triggerAE timeout: node %d (%s) didn't fire AE", i, n.transport.nodeID)
 		}
-		time.Sleep(time.Millisecond)
 	}
-	t.Logf("warning: triggerAE timed out waiting for AE goroutines (pending=%d)", bus.PendingCount())
 }
 
 // assertHasKey fails if the store has no entry for key.
@@ -413,7 +446,7 @@ func TestSimBroadcastMissedThenAntiEntropy(t *testing.T) {
 	bus.ClearPartition()
 
 	// Advance clock past AE interval. Each node sends its snapshot to a peer.
-	triggerAE(t, []*simNode{n1, n2}, clock, bus)
+	triggerAE(t, []*simNode{n1, n2}, clock)
 	bus.DeliverAll()
 	bus.DrainInbox()
 
@@ -460,7 +493,7 @@ func TestSimBroadcastMissedThenAntiEntropyFullSync(t *testing.T) {
 
 	// Heal and trigger AE.
 	bus.ClearPartition()
-	triggerAE(t, []*simNode{n1, n2}, clock, bus)
+	triggerAE(t, []*simNode{n1, n2}, clock)
 	bus.DeliverAll()
 	bus.DrainInbox()
 
@@ -558,7 +591,7 @@ func TestSimConvergenceAfterPartition(t *testing.T) {
 	// Two AE rounds: first round each node sends its snapshot.
 	// n1 → n2 carries k=v2 (v2 > v1, so n2 updates)
 	// n2 → n1 carries other=x (n1 didn't have it)
-	triggerAE(t, []*simNode{n1, n2}, clock, bus)
+	triggerAE(t, []*simNode{n1, n2}, clock)
 	bus.DeliverAll()
 	bus.DrainInbox()
 
