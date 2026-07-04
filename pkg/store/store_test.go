@@ -115,6 +115,61 @@ func TestSetAutoVersion(t *testing.T) {
 	}
 }
 
+func TestRange(t *testing.T) {
+	s := New()
+	s.Set("b", "2")
+	s.Set("a", "1")
+	s.Set("c", "3")
+	s.Set("d", "4")
+
+	results := s.Range("b", "d") // [b, d) → b, c only
+	if len(results) != 2 {
+		t.Fatalf("expected 2 entries in [b, d), got %d", len(results))
+	}
+	if results[0].Value != "2" {
+		t.Errorf("first in range: expected 2, got %s", results[0].Value)
+	}
+	if results[1].Value != "3" {
+		t.Errorf("second in range: expected 3, got %s", results[1].Value)
+	}
+}
+
+func TestIterate(t *testing.T) {
+	s := New()
+	s.Set("z", "last")
+	s.Set("a", "first")
+	s.Set("m", "middle")
+
+	var keys []string
+	s.Iterate(func(key string, e Entry) bool {
+		keys = append(keys, key)
+		return true
+	})
+
+	if len(keys) != 3 {
+		t.Fatalf("expected 3 keys, got %d", len(keys))
+	}
+	if keys[0] != "a" || keys[1] != "m" || keys[2] != "z" {
+		t.Fatalf("expected sorted [a m z], got %v", keys)
+	}
+}
+
+func TestIterateEarlyStop(t *testing.T) {
+	s := New()
+	s.Set("a", "1")
+	s.Set("b", "2")
+	s.Set("c", "3")
+
+	count := 0
+	s.Iterate(func(key string, e Entry) bool {
+		count++
+		return count < 2 // stop after one
+	})
+	if count != 2 {
+		t.Fatalf("expected 2 calls (one + stop), got %d", count)
+	}
+}
+
 func TestConcurrency(t *testing.T) {
 	s := New()
 	var wg sync.WaitGroup
