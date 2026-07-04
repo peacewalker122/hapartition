@@ -18,3 +18,29 @@ message EntryBatch {
 message NodeMeta {
   string redis_addr = 1; // e.g. "10.0.0.1:6379"
 }
+
+// GossipMessage is the top-level wire envelope. The payload is one of:
+//   - entry_batch: best-effort broadcast or anti-entropy snapshot
+//   - replicate_req: reliable point-to-point write request
+//   - replicate_resp: ACK for a replicate_req
+message GossipMessage {
+  oneof payload {
+    EntryBatch entry_batch = 1;
+    ReplicateRequest replicate_req = 2;
+    ReplicateResponse replicate_resp = 3;
+  }
+}
+
+// ReplicateRequest instructs a replica to apply a set of entries and ACK back.
+message ReplicateRequest {
+  string request_id = 1;   // correlation ID for the ACK
+  string sender_id = 2;    // who to send the ACK back to
+  repeated Entry entries = 3;
+}
+
+// ReplicateResponse is the ACK for a ReplicateRequest.
+message ReplicateResponse {
+  string request_id = 1;
+  string node_id = 2;
+  bool success = 3;
+}

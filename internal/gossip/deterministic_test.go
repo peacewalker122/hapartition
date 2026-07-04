@@ -11,7 +11,6 @@ import (
 
 // ─── ManualClock ────────────────────────────────────────────────────────────
 
-// ManualClock implements Clock. Time advances only when the test calls Advance.
 type ManualClock struct {
 	mu      sync.Mutex
 	now     time.Time
@@ -33,9 +32,6 @@ func (c *ManualClock) Now() time.Time {
 	return c.now
 }
 
-// After returns a channel that fires when Advance moves time past the
-// deadline. Only the most recently created channel fires per deadline —
-// the anti-entropy loop creates one, fires, then creates the next.
 func (c *ManualClock) After(d time.Duration) <-chan time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -45,8 +41,6 @@ func (c *ManualClock) After(d time.Duration) <-chan time.Time {
 	return ch
 }
 
-// Advance moves the clock forward by d and fires every pending After channel
-// whose deadline has been reached or passed.
 func (c *ManualClock) Advance(d time.Duration) {
 	c.mu.Lock()
 	c.now = c.now.Add(d)
@@ -62,8 +56,6 @@ func (c *ManualClock) Advance(d time.Duration) {
 	c.mu.Unlock()
 }
 
-// WaitForPending blocks until at least n After() calls have been registered,
-// or timeout expires. Returns true if n pending entries were observed.
 func (c *ManualClock) WaitForPending(n int, timeout time.Duration) bool {
 	deadline := time.After(timeout)
 	for {
@@ -83,20 +75,17 @@ func (c *ManualClock) WaitForPending(n int, timeout time.Duration) bool {
 
 // ─── MessageBus ─────────────────────────────────────────────────────────────
 
-// Message is an in-flight message between simulated transports.
 type Message struct {
 	From string
-	To   string // "" means broadcast to all
+	To   string
 	Buf  []byte
 }
 
-// MessageBus routes messages between simulated transports. The test
-// controls delivery by calling DeliverAll.
 type MessageBus struct {
 	mu        sync.Mutex
 	nodes     map[string]*simulatedTransport
 	pending   []Message
-	partition func(from, to string) bool // nil = no partition
+	partition func(from, to string) bool
 }
 
 func NewMessageBus() *MessageBus {
@@ -105,23 +94,18 @@ func NewMessageBus() *MessageBus {
 	}
 }
 
-// SetPartition installs a function that returns true when messages from→to
-// should be dropped.
 func (b *MessageBus) SetPartition(fn func(from, to string) bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.partition = fn
 }
 
-// ClearPartition removes the partition function.
 func (b *MessageBus) ClearPartition() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.partition = nil
 }
 
-// DeliverAll delivers every pending message in FIFO order. Messages blocked
-// by a partition are dropped silently.
 func (b *MessageBus) DeliverAll() {
 	for {
 		b.mu.Lock()
@@ -138,7 +122,6 @@ func (b *MessageBus) DeliverAll() {
 	}
 }
 
-// PendingCount returns the number of undelivered messages.
 func (b *MessageBus) PendingCount() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -147,7 +130,6 @@ func (b *MessageBus) PendingCount() int {
 
 func (b *MessageBus) deliver(msg Message, part func(from, to string) bool) {
 	if msg.To == "" {
-		// Broadcast to all nodes except sender
 		for id, n := range b.nodes {
 			if id == msg.From {
 				continue
@@ -173,13 +155,9 @@ func (b *MessageBus) queue(msg Message) {
 	b.mu.Unlock()
 }
 
-// DrainInbox drains all pending messages from each node's inbox and
-// processes them via the node's OnMessage handler. Call this after each
-// DeliverAll to process delivered messages.
 func (b *MessageBus) DrainInbox() {
 	for {
 		b.mu.Lock()
-		// Collect one message from any node's inbox
 		var found bool
 		var msg Message
 		var target *simulatedTransport
@@ -208,7 +186,6 @@ func (b *MessageBus) DrainInbox() {
 
 // ─── simulatedTransport ─────────────────────────────────────────────────────
 
-// simulatedTransport implements GossipTransport via a shared MessageBus.
 type simulatedTransport struct {
 	nodeID    string
 	redisAddr string
@@ -216,7 +193,7 @@ type simulatedTransport struct {
 	inbox     chan Message
 	handlers  TransportHandlers
 	started   bool
-	aeFired   chan struct{} // ponytail: signals SendReliable calls from AE goroutine
+	aeFired   chan struct{}
 }
 
 func newSimulatedTransport(nodeID, redisAddr string, bus *MessageBus) *simulatedTransport {
@@ -234,7 +211,6 @@ func (s *simulatedTransport) Start(cfg TransportConfig) error {
 	s.redisAddr = cfg.RedisAddr
 	s.started = true
 
-	// Register with the bus
 	s.bus.mu.Lock()
 	s.bus.nodes[cfg.NodeID] = s
 	s.bus.mu.Unlock()
@@ -270,7 +246,7 @@ func (s *simulatedTransport) Members() []MemberInfo {
 		info = append(info, MemberInfo{
 			Name:      id,
 			RedisAddr: n.redisAddr,
-			Addr:      id, // gossip addr = node ID for simulated
+			Addr:      id,
 			Status:    "alive",
 		})
 	}
@@ -279,7 +255,6 @@ func (s *simulatedTransport) Members() []MemberInfo {
 
 func (s *simulatedTransport) SendReliable(nodeID string, buf []byte) error {
 	s.bus.queue(Message{From: s.nodeID, To: nodeID, Buf: cloneBytes(buf)})
-	// Signal that AE (or any reliable send) fired — used by triggerAE.
 	select {
 	case s.aeFired <- struct{}{}:
 	default:
@@ -323,13 +298,14 @@ func startSimNode(t *testing.T, nodeID, redisAddr string, bus *MessageBus, clock
 	sim := newSimulatedTransport(nodeID, redisAddr, bus)
 
 	h := New(Config{
-		NodeID:    nodeID,
-		RedisAddr: redisAddr,
-		Store:     st,
-		Ring:      ring,
-		ReplicaRF: 2,
-		Transport: sim,
-		Clock:     clock,
+		NodeID:       nodeID,
+		RedisAddr:    redisAddr,
+		Store:        st,
+		Ring:         ring,
+		ReplicaRF:    2,
+		WriteConcern: 2,
+		Transport:    sim,
+		Clock:        clock,
 	})
 
 	if err := h.Start(); err != nil {
@@ -346,35 +322,86 @@ func startSimNode(t *testing.T, nodeID, redisAddr string, bus *MessageBus, clock
 	}
 }
 
-// triggerAE advances the clock past the anti-entropy interval to trigger
-// exchangeState on all nodes. Waits on explicit synchronization channels
-// (aeFired) instead of polling, eliminating the real-time race.
-func triggerAE(t *testing.T, nodes []*simNode, clock *ManualClock) {
-	t.Helper()
-
-	// Wait for AE goroutines to register their After() calls
-	if !clock.WaitForPending(len(nodes), 2*time.Second) {
-		t.Fatalf("triggerAE timeout: waiting for AE goroutines to register")
-	}
-
-	// Advance past the AE interval (default 30s). The AE goroutines' After
-	// channels fire, causing each to call exchangeState → SendReliable → bus.
-	clock.Advance(31 * time.Second)
-
-	// Wait for each node's AE goroutine to call SendReliable.
-	// Each node picks one peer in exchangeState, so we expect one signal per
-	// node. Channels are buffered, so signals from goroutines that fire before
-	// we reach them are captured.
-	for i, n := range nodes {
-		select {
-		case <-n.transport.aeFired:
-		case <-time.After(2 * time.Second):
-			t.Fatalf("triggerAE timeout: node %d (%s) didn't fire AE", i, n.transport.nodeID)
+// crossConnect adds all nodes to each other's rings so GetReplicas can find
+// remote nodes for point-to-point replication.
+func crossConnect(nodes ...*simNode) {
+	for _, a := range nodes {
+		for _, b := range nodes {
+			if a == b {
+				continue
+			}
+			a.Ring.AddNode(b.Handler.NodeID(), b.Handler.cfg.RedisAddr, 256)
 		}
 	}
 }
 
-// assertHasKey fails if the store has no entry for key.
+// replicateAndDeliver runs ReplicateWithQuorum in a goroutine and delivers
+// messages via the bus until the quorum is satisfied or timeout.
+func replicateAndDeliver(t *testing.T, h *Handler, key, value string, version int64, w int, bus *MessageBus) {
+	t.Helper()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- h.ReplicateWithQuorum(key, value, version, w)
+	}()
+
+	deadline := time.After(3 * time.Second)
+	for {
+		bus.DeliverAll()
+		bus.DrainInbox()
+		select {
+		case err := <-errCh:
+			if err != nil {
+				t.Fatalf("replicate %s: %v", key, err)
+			}
+			return
+		case <-deadline:
+			t.Fatal("replicate: timed out waiting for quorum")
+		default:
+		}
+	}
+}
+
+// triggerAE advances the clock past the anti-entropy interval and delivers
+// all resulting messages until the bus is quiet.
+func triggerAE(t *testing.T, nodes []*simNode, clock *ManualClock, bus *MessageBus) {
+	t.Helper()
+	// Drain stale aeFired signals from prior quorum writes.
+	for _, n := range nodes {
+	forDrain:
+		for {
+			select {
+			case <-n.transport.aeFired:
+			default:
+				break forDrain
+			}
+		}
+	}
+
+	if !clock.WaitForPending(len(nodes), 2*time.Second) {
+		t.Fatalf("triggerAE timeout: waiting for AE goroutines to register")
+	}
+	clock.Advance(31 * time.Second)
+
+	// Deliver and process messages until the bus is quiet.
+	deadline := time.After(2 * time.Second)
+	for {
+		bus.DeliverAll()
+		bus.DrainInbox()
+		if bus.PendingCount() == 0 {
+			// Short sleep to let any in-flight goroutines queue more messages.
+			time.Sleep(10 * time.Millisecond)
+			if bus.PendingCount() == 0 {
+				return
+			}
+		}
+		select {
+		case <-deadline:
+			return
+		default:
+		}
+	}
+}
+
 func assertHasKey(t *testing.T, st *store.Store, key, expectedValue string) {
 	t.Helper()
 	val, _, ok := st.Get(key)
@@ -386,7 +413,6 @@ func assertHasKey(t *testing.T, st *store.Store, key, expectedValue string) {
 	}
 }
 
-// assertNoKey fails if the store has an entry for key.
 func assertNoKey(t *testing.T, st *store.Store, key string) {
 	t.Helper()
 	_, _, ok := st.Get(key)
@@ -397,107 +423,106 @@ func assertNoKey(t *testing.T, st *store.Store, key string) {
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
-func TestSimBroadcastReplicates(t *testing.T) {
+func TestQuorumWriteReplicates(t *testing.T) {
 	clock := NewManualClock()
 	bus := NewMessageBus()
 
 	n1 := startSimNode(t, "n1", "127.0.0.1:6379", bus, clock)
 	n2 := startSimNode(t, "n2", "127.0.0.2:6379", bus, clock)
+	crossConnect(n1, n2)
 
-	// n1 writes a key and broadcasts.
-	n1.Store.Set("foo", "v1")
-	n1.Handler.Broadcast("foo", "v1", 1)
+	replicateAndDeliver(t, n1.Handler, "foo", "v1", 1, 2, bus)
 
-	// Deliver the broadcast message.
-	bus.DeliverAll()
-	bus.DrainInbox()
-
-	// n2 should have the key via broadcast replication.
-	assertHasKey(t, n2.Store, "foo", "v1")
 	assertHasKey(t, n1.Store, "foo", "v1")
+	assertHasKey(t, n2.Store, "foo", "v1")
 }
 
-func TestSimBroadcastMissedThenAntiEntropy(t *testing.T) {
+func TestQuorumWriteW1(t *testing.T) {
 	clock := NewManualClock()
 	bus := NewMessageBus()
 
 	n1 := startSimNode(t, "n1", "127.0.0.1:6379", bus, clock)
 	n2 := startSimNode(t, "n2", "127.0.0.2:6379", bus, clock)
-	_ = n2
+	crossConnect(n1, n2)
 
-	// n1 writes v1, broadcasts. Deliver.
-	n1.Store.Set("k", "v1")
-	n1.Handler.Broadcast("k", "v1", 1)
-	bus.DeliverAll()
-	bus.DrainInbox()
+	// W=1: only local write confirmed, no remote replication.
+	if err := n1.Handler.ReplicateWithQuorum("key", "val", 1, 1); err != nil {
+		t.Fatalf("W=1 write failed: %v", err)
+	}
 
-	// Now write v2 but with a partition so the broadcast never reaches n2.
+	assertHasKey(t, n1.Store, "key", "val")
+	assertNoKey(t, n2.Store, "key")
+}
+
+func TestQuorumWriteMissedThenAntiEntropy(t *testing.T) {
+	clock := NewManualClock()
+	bus := NewMessageBus()
+
+	n1 := startSimNode(t, "n1", "127.0.0.1:6379", bus, clock)
+	n2 := startSimNode(t, "n2", "127.0.0.2:6379", bus, clock)
+	crossConnect(n1, n2)
+
+	// Write v1 with W=2 — both get it.
+	replicateAndDeliver(t, n1.Handler, "k", "v1", 1, 2, bus)
+	assertHasKey(t, n2.Store, "k", "v1")
+
+	// Partition: n2 can't receive from n1.
 	bus.SetPartition(func(from, to string) bool {
 		return from == "n1" && to == "n2"
 	})
-	n1.Store.Set("k", "v2") // version 2 — n1 only
-	n1.Handler.Broadcast("k", "v2", 2)
-	bus.DeliverAll()
-	bus.DrainInbox()
-	// n2 still has v1 via the first broadcast.
+
+	// Write v2 with W=1 (since W=2 would timeout under partition).
+	if err := n1.Handler.ReplicateWithQuorum("k", "v2", 2, 1); err != nil {
+		t.Fatalf("W=1 write failed: %v", err)
+	}
+	// n2 still has v1.
 	assertHasKey(t, n2.Store, "k", "v1")
 
-	// Heal partition.
+	// Heal.
 	bus.ClearPartition()
 
-	// Advance clock past AE interval. Each node sends its snapshot to a peer.
-	triggerAE(t, []*simNode{n1, n2}, clock)
-	bus.DeliverAll()
-	bus.DrainInbox()
-
-	// n2 should now have v2 via anti-entropy (LWW picks version 2 > 1).
+	// Anti-entropy converges n2 to v2.
+	triggerAE(t, []*simNode{n1, n2}, clock, bus)
 	assertHasKey(t, n2.Store, "k", "v2")
 }
 
-func TestSimBroadcastMissedThenAntiEntropyFullSync(t *testing.T) {
+func TestQuorumWriteFullSyncAfterPartition(t *testing.T) {
 	clock := NewManualClock()
 	bus := NewMessageBus()
 
 	n1 := startSimNode(t, "n1", "127.0.0.1:6379", bus, clock)
 	n2 := startSimNode(t, "n2", "127.0.0.2:6379", bus, clock)
+	crossConnect(n1, n2)
 
-	// n1 writes 10 keys.
+	// Seed 10 keys via quorum W=2.
 	for i := 0; i < 10; i++ {
 		key := string(rune('a' + i))
 		n1.Store.Set(key, "v1")
+		replicateAndDeliver(t, n1.Handler, key, "v1", int64(i+1), 2, bus)
 	}
-	// Broadcast each (so they get replicated).
-	for i := 0; i < 10; i++ {
-		key := string(rune('a' + i))
-		n1.Handler.Broadcast(key, "v1", int64(i+1))
-	}
-	bus.DeliverAll()
-	bus.DrainInbox()
 
-	// n1 writes 5 more keys with partition active, so n2 misses them.
+	// Partition: n2 isolated.
 	bus.SetPartition(func(from, to string) bool {
 		return from == "n1" && to == "n2"
 	})
+
+	// Write 5 more keys with W=1 (partitioned).
 	for i := 10; i < 15; i++ {
 		key := string(rune('a' + i))
 		n1.Store.Set(key, "v2")
-		n1.Handler.Broadcast(key, "v2", int64(i+1))
+		if err := n1.Handler.ReplicateWithQuorum(key, "v2", int64(i+1), 1); err != nil {
+			t.Fatalf("W=1 write %s: %v", key, err)
+		}
 	}
-	bus.DeliverAll()
-	bus.DrainInbox()
-	// n2 should not have keys 'k' through 'o'.
 	for i := 10; i < 15; i++ {
 		key := string(rune('a' + i))
 		assertNoKey(t, n2.Store, key)
 	}
 
-	// Heal and trigger AE.
+	// Heal and AE.
 	bus.ClearPartition()
-	triggerAE(t, []*simNode{n1, n2}, clock)
-	bus.DeliverAll()
-	bus.DrainInbox()
+	triggerAE(t, []*simNode{n1, n2}, clock, bus)
 
-	// Now n2 should have all 15 keys. Keys 'a'–'j' are v1, keys 'k'–'o' are v2.
 	for i := 0; i < 15; i++ {
 		key := string(rune('a' + i))
 		want := "v1"
@@ -508,114 +533,99 @@ func TestSimBroadcastMissedThenAntiEntropyFullSync(t *testing.T) {
 	}
 }
 
-func TestSimThreeNodeBroadcast(t *testing.T) {
+func TestQuorumWriteThreeNodes(t *testing.T) {
 	clock := NewManualClock()
 	bus := NewMessageBus()
 
 	n1 := startSimNode(t, "n1", "127.0.0.1:6379", bus, clock)
 	n2 := startSimNode(t, "n2", "127.0.0.2:6379", bus, clock)
 	n3 := startSimNode(t, "n3", "127.0.0.3:6379", bus, clock)
+	crossConnect(n1, n2, n3)
 
-	// n1 writes and broadcasts.
-	n1.Store.Set("shared", "hello")
-	n1.Handler.Broadcast("shared", "hello", 1)
+	replicateAndDeliver(t, n1.Handler, "shared", "hello", 1, 2, bus)
 
-	bus.DeliverAll()
-	bus.DrainInbox()
-
-	// All three nodes should have the key.
-	assertHasKey(t, n1.Store, "shared", "hello")
-	assertHasKey(t, n2.Store, "shared", "hello")
-	assertHasKey(t, n3.Store, "shared", "hello")
+	// RF=2: exactly 2 of 3 nodes should have the key.
+	count := 0
+	for _, s := range []*store.Store{n1.Store, n2.Store, n3.Store} {
+		v, _, ok := s.Get("shared")
+		if ok {
+			if v != "hello" {
+				t.Errorf("expected 'hello', got %q", v)
+			}
+			count++
+		}
+	}
+	if count != 2 {
+		t.Errorf("expected exactly 2 replicas, got %d", count)
+	}
 }
 
-func TestSimMultipleWritesDeterministic(t *testing.T) {
+func TestQuorumWriteMultipleKeys(t *testing.T) {
 	clock := NewManualClock()
 	bus := NewMessageBus()
 
 	n1 := startSimNode(t, "n1", "127.0.0.1:6379", bus, clock)
 	n2 := startSimNode(t, "n2", "127.0.0.2:6379", bus, clock)
+	crossConnect(n1, n2)
 
-	// Write three keys in sequence.
 	for i, kv := range []struct{ k, v string }{
 		{"a", "1"}, {"b", "2"}, {"c", "3"},
 	} {
-		n1.Store.Set(kv.k, kv.v)
-		n1.Handler.Broadcast(kv.k, kv.v, int64(i+1))
+		replicateAndDeliver(t, n1.Handler, kv.k, kv.v, int64(i+1), 2, bus)
 	}
-
-	bus.DeliverAll()
-	bus.DrainInbox()
 
 	assertHasKey(t, n2.Store, "a", "1")
 	assertHasKey(t, n2.Store, "b", "2")
 	assertHasKey(t, n2.Store, "c", "3")
 }
 
-func TestSimConvergenceAfterPartition(t *testing.T) {
+func TestQuorumWriteConvergenceAfterPartition(t *testing.T) {
 	clock := NewManualClock()
 	bus := NewMessageBus()
 
 	n1 := startSimNode(t, "n1", "127.0.0.1:6379", bus, clock)
 	n2 := startSimNode(t, "n2", "127.0.0.2:6379", bus, clock)
+	crossConnect(n1, n2)
 
-	// Seed initial state via broadcast.
-	n1.Store.Set("k", "v1")
-	n1.Handler.Broadcast("k", "v1", 1)
-	bus.DeliverAll()
-	bus.DrainInbox()
+	// Seed initial state.
+	replicateAndDeliver(t, n1.Handler, "k", "v1", 1, 2, bus)
 
-	// Partition: n1 isolated.
+	// Partition both directions.
 	bus.SetPartition(func(from, to string) bool {
 		return (from == "n1" && to == "n2") || (from == "n2" && to == "n1")
 	})
 
-	// Both sides write during partition.
-	n1.Store.Set("k", "v2") // version 2
-	n1.Handler.Broadcast("k", "v2", 2)
+	// Both sides write with W=1 during partition.
+	if err := n1.Handler.ReplicateWithQuorum("k", "v2", 2, 1); err != nil {
+		t.Fatalf("n1 write: %v", err)
+	}
+	if err := n2.Handler.ReplicateWithQuorum("other", "x", 10, 1); err != nil {
+		t.Fatalf("n2 write: %v", err)
+	}
 
-	n2.Store.Set("other", "x") // different key on n2
-	n2.Handler.Broadcast("other", "x", 10)
-
-	bus.DeliverAll()
-	bus.DrainInbox()
-
-	// n2 should not see v2.
 	assertHasKey(t, n2.Store, "k", "v1")
-	// n1 should not see "other".
 	assertNoKey(t, n1.Store, "other")
 
 	// Heal.
 	bus.ClearPartition()
 
-	// Two AE rounds: first round each node sends its snapshot.
-	// n1 → n2 carries k=v2 (v2 > v1, so n2 updates)
-	// n2 → n1 carries other=x (n1 didn't have it)
-	triggerAE(t, []*simNode{n1, n2}, clock)
-	bus.DeliverAll()
-	bus.DrainInbox()
+	triggerAE(t, []*simNode{n1, n2}, clock, bus)
 
-	// Both nodes should have both keys after convergence.
 	assertHasKey(t, n1.Store, "k", "v2")
 	assertHasKey(t, n1.Store, "other", "x")
 	assertHasKey(t, n2.Store, "k", "v2")
 	assertHasKey(t, n2.Store, "other", "x")
 }
 
-// TestSimDeterministicRunTwice verifies that two identical test runs produce
-// the same result (the test itself is deterministic).
-func TestSimDeterministicRunTwice(t *testing.T) {
+func TestQuorumWriteDeterministic(t *testing.T) {
 	run := func() string {
 		clock := NewManualClock()
 		bus := NewMessageBus()
 		n1 := startSimNode(t, "n1", ":6379", bus, clock)
 		n2 := startSimNode(t, "n2", ":6380", bus, clock)
+		crossConnect(n1, n2)
 
-		n1.Store.Set("k", "val")
-		n1.Handler.Broadcast("k", "val", 1)
-		bus.DeliverAll()
-		bus.DrainInbox()
-
+		replicateAndDeliver(t, n1.Handler, "k", "val", 1, 2, bus)
 		val, _, _ := n2.Store.Get("k")
 		return val
 	}
@@ -624,5 +634,44 @@ func TestSimDeterministicRunTwice(t *testing.T) {
 	r2 := run()
 	if r1 != r2 {
 		t.Fatalf("non-deterministic: first run=%q second run=%q", r1, r2)
+	}
+}
+
+func TestQuorumWriteTimeout(t *testing.T) {
+	clock := NewManualClock()
+	bus := NewMessageBus()
+
+	n1 := startSimNode(t, "n1", "127.0.0.1:6379", bus, clock)
+	n2 := startSimNode(t, "n2", "127.0.0.2:6379", bus, clock)
+	crossConnect(n1, n2)
+
+	// Partition to prevent ACKs from reaching n1.
+	bus.SetPartition(func(from, to string) bool {
+		return from == "n2" && to == "n1"
+	})
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- n1.Handler.ReplicateWithQuorum("key", "val", 1, 2)
+	}()
+
+	// Deliver request to n2; ACK from n2 is blocked by partition.
+	// Wait for the quorum to time out.
+	deadline := time.After(4 * time.Second)
+	for {
+		bus.DeliverAll()
+		bus.DrainInbox()
+		select {
+		case err := <-errCh:
+			if err == nil {
+				t.Fatal("expected timeout error, got nil")
+			}
+			t.Logf("got expected error: %v", err)
+			return
+		case <-deadline:
+			t.Fatal("replicate didn't timeout within test deadline")
+		default:
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }

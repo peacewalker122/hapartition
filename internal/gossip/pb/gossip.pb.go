@@ -172,6 +172,230 @@ func (x *NodeMeta) GetRedisAddr() string {
 	return ""
 }
 
+// GossipMessage is the top-level wire envelope. The payload is one of:
+//   - entry_batch: best-effort broadcast or anti-entropy snapshot
+//   - replicate_req: reliable point-to-point write request
+//   - replicate_resp: ACK for a replicate_req
+type GossipMessage struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Payload:
+	//
+	//	*GossipMessage_EntryBatch
+	//	*GossipMessage_ReplicateReq
+	//	*GossipMessage_ReplicateResp
+	Payload       isGossipMessage_Payload `protobuf_oneof:"payload"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GossipMessage) Reset() {
+	*x = GossipMessage{}
+	mi := &file_internal_gossip_pb_gossip_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GossipMessage) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GossipMessage) ProtoMessage() {}
+
+func (x *GossipMessage) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_gossip_pb_gossip_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GossipMessage.ProtoReflect.Descriptor instead.
+func (*GossipMessage) Descriptor() ([]byte, []int) {
+	return file_internal_gossip_pb_gossip_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *GossipMessage) GetPayload() isGossipMessage_Payload {
+	if x != nil {
+		return x.Payload
+	}
+	return nil
+}
+
+func (x *GossipMessage) GetEntryBatch() *EntryBatch {
+	if x != nil {
+		if x, ok := x.Payload.(*GossipMessage_EntryBatch); ok {
+			return x.EntryBatch
+		}
+	}
+	return nil
+}
+
+func (x *GossipMessage) GetReplicateReq() *ReplicateRequest {
+	if x != nil {
+		if x, ok := x.Payload.(*GossipMessage_ReplicateReq); ok {
+			return x.ReplicateReq
+		}
+	}
+	return nil
+}
+
+func (x *GossipMessage) GetReplicateResp() *ReplicateResponse {
+	if x != nil {
+		if x, ok := x.Payload.(*GossipMessage_ReplicateResp); ok {
+			return x.ReplicateResp
+		}
+	}
+	return nil
+}
+
+type isGossipMessage_Payload interface {
+	isGossipMessage_Payload()
+}
+
+type GossipMessage_EntryBatch struct {
+	EntryBatch *EntryBatch `protobuf:"bytes,1,opt,name=entry_batch,json=entryBatch,proto3,oneof"`
+}
+
+type GossipMessage_ReplicateReq struct {
+	ReplicateReq *ReplicateRequest `protobuf:"bytes,2,opt,name=replicate_req,json=replicateReq,proto3,oneof"`
+}
+
+type GossipMessage_ReplicateResp struct {
+	ReplicateResp *ReplicateResponse `protobuf:"bytes,3,opt,name=replicate_resp,json=replicateResp,proto3,oneof"`
+}
+
+func (*GossipMessage_EntryBatch) isGossipMessage_Payload() {}
+
+func (*GossipMessage_ReplicateReq) isGossipMessage_Payload() {}
+
+func (*GossipMessage_ReplicateResp) isGossipMessage_Payload() {}
+
+// ReplicateRequest instructs a replica to apply a set of entries and ACK back.
+type ReplicateRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	RequestId     string                 `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"` // correlation ID for the ACK
+	SenderId      string                 `protobuf:"bytes,2,opt,name=sender_id,json=senderId,proto3" json:"sender_id,omitempty"`    // who to send the ACK back to
+	Entries       []*Entry               `protobuf:"bytes,3,rep,name=entries,proto3" json:"entries,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReplicateRequest) Reset() {
+	*x = ReplicateRequest{}
+	mi := &file_internal_gossip_pb_gossip_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReplicateRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReplicateRequest) ProtoMessage() {}
+
+func (x *ReplicateRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_gossip_pb_gossip_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReplicateRequest.ProtoReflect.Descriptor instead.
+func (*ReplicateRequest) Descriptor() ([]byte, []int) {
+	return file_internal_gossip_pb_gossip_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *ReplicateRequest) GetRequestId() string {
+	if x != nil {
+		return x.RequestId
+	}
+	return ""
+}
+
+func (x *ReplicateRequest) GetSenderId() string {
+	if x != nil {
+		return x.SenderId
+	}
+	return ""
+}
+
+func (x *ReplicateRequest) GetEntries() []*Entry {
+	if x != nil {
+		return x.Entries
+	}
+	return nil
+}
+
+// ReplicateResponse is the ACK for a ReplicateRequest.
+type ReplicateResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	RequestId     string                 `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	NodeId        string                 `protobuf:"bytes,2,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	Success       bool                   `protobuf:"varint,3,opt,name=success,proto3" json:"success,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReplicateResponse) Reset() {
+	*x = ReplicateResponse{}
+	mi := &file_internal_gossip_pb_gossip_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReplicateResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReplicateResponse) ProtoMessage() {}
+
+func (x *ReplicateResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_gossip_pb_gossip_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReplicateResponse.ProtoReflect.Descriptor instead.
+func (*ReplicateResponse) Descriptor() ([]byte, []int) {
+	return file_internal_gossip_pb_gossip_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *ReplicateResponse) GetRequestId() string {
+	if x != nil {
+		return x.RequestId
+	}
+	return ""
+}
+
+func (x *ReplicateResponse) GetNodeId() string {
+	if x != nil {
+		return x.NodeId
+	}
+	return ""
+}
+
+func (x *ReplicateResponse) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
 var File_internal_gossip_pb_gossip_proto protoreflect.FileDescriptor
 
 const file_internal_gossip_pb_gossip_proto_rawDesc = "" +
@@ -186,7 +410,23 @@ const file_internal_gossip_pb_gossip_proto_rawDesc = "" +
 	"\aentries\x18\x01 \x03(\v2\r.gossip.EntryR\aentries\")\n" +
 	"\bNodeMeta\x12\x1d\n" +
 	"\n" +
-	"redis_addr\x18\x01 \x01(\tR\tredisAddrB:Z8github.com/peacewalker122/hapartition/internal/gossip/pbb\x06proto3"
+	"redis_addr\x18\x01 \x01(\tR\tredisAddr\"\xd6\x01\n" +
+	"\rGossipMessage\x125\n" +
+	"\ventry_batch\x18\x01 \x01(\v2\x12.gossip.EntryBatchH\x00R\n" +
+	"entryBatch\x12?\n" +
+	"\rreplicate_req\x18\x02 \x01(\v2\x18.gossip.ReplicateRequestH\x00R\freplicateReq\x12B\n" +
+	"\x0ereplicate_resp\x18\x03 \x01(\v2\x19.gossip.ReplicateResponseH\x00R\rreplicateRespB\t\n" +
+	"\apayload\"w\n" +
+	"\x10ReplicateRequest\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\x01 \x01(\tR\trequestId\x12\x1b\n" +
+	"\tsender_id\x18\x02 \x01(\tR\bsenderId\x12'\n" +
+	"\aentries\x18\x03 \x03(\v2\r.gossip.EntryR\aentries\"e\n" +
+	"\x11ReplicateResponse\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\x01 \x01(\tR\trequestId\x12\x17\n" +
+	"\anode_id\x18\x02 \x01(\tR\x06nodeId\x12\x18\n" +
+	"\asuccess\x18\x03 \x01(\bR\asuccessB:Z8github.com/peacewalker122/hapartition/internal/gossip/pbb\x06proto3"
 
 var (
 	file_internal_gossip_pb_gossip_proto_rawDescOnce sync.Once
@@ -200,19 +440,26 @@ func file_internal_gossip_pb_gossip_proto_rawDescGZIP() []byte {
 	return file_internal_gossip_pb_gossip_proto_rawDescData
 }
 
-var file_internal_gossip_pb_gossip_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
+var file_internal_gossip_pb_gossip_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
 var file_internal_gossip_pb_gossip_proto_goTypes = []any{
-	(*Entry)(nil),      // 0: gossip.Entry
-	(*EntryBatch)(nil), // 1: gossip.EntryBatch
-	(*NodeMeta)(nil),   // 2: gossip.NodeMeta
+	(*Entry)(nil),             // 0: gossip.Entry
+	(*EntryBatch)(nil),        // 1: gossip.EntryBatch
+	(*NodeMeta)(nil),          // 2: gossip.NodeMeta
+	(*GossipMessage)(nil),     // 3: gossip.GossipMessage
+	(*ReplicateRequest)(nil),  // 4: gossip.ReplicateRequest
+	(*ReplicateResponse)(nil), // 5: gossip.ReplicateResponse
 }
 var file_internal_gossip_pb_gossip_proto_depIdxs = []int32{
 	0, // 0: gossip.EntryBatch.entries:type_name -> gossip.Entry
-	1, // [1:1] is the sub-list for method output_type
-	1, // [1:1] is the sub-list for method input_type
-	1, // [1:1] is the sub-list for extension type_name
-	1, // [1:1] is the sub-list for extension extendee
-	0, // [0:1] is the sub-list for field type_name
+	1, // 1: gossip.GossipMessage.entry_batch:type_name -> gossip.EntryBatch
+	4, // 2: gossip.GossipMessage.replicate_req:type_name -> gossip.ReplicateRequest
+	5, // 3: gossip.GossipMessage.replicate_resp:type_name -> gossip.ReplicateResponse
+	0, // 4: gossip.ReplicateRequest.entries:type_name -> gossip.Entry
+	5, // [5:5] is the sub-list for method output_type
+	5, // [5:5] is the sub-list for method input_type
+	5, // [5:5] is the sub-list for extension type_name
+	5, // [5:5] is the sub-list for extension extendee
+	0, // [0:5] is the sub-list for field type_name
 }
 
 func init() { file_internal_gossip_pb_gossip_proto_init() }
@@ -220,13 +467,18 @@ func file_internal_gossip_pb_gossip_proto_init() {
 	if File_internal_gossip_pb_gossip_proto != nil {
 		return
 	}
+	file_internal_gossip_pb_gossip_proto_msgTypes[3].OneofWrappers = []any{
+		(*GossipMessage_EntryBatch)(nil),
+		(*GossipMessage_ReplicateReq)(nil),
+		(*GossipMessage_ReplicateResp)(nil),
+	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_internal_gossip_pb_gossip_proto_rawDesc), len(file_internal_gossip_pb_gossip_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   3,
+			NumMessages:   6,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
