@@ -2,10 +2,12 @@ package gossip
 
 import (
 	"crypto/tls"
+	"fmt"
 	"log"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/peacewalker122/hapartition/internal/gossip/pb"
@@ -20,6 +22,10 @@ type Discoverer interface {
 }
 
 const eventRingSize = 200
+
+// DefaultReplicateTimeout is the timeout for waiting for ACKs from replicas
+// during a quorum write.
+const DefaultReplicateTimeout = 2 * time.Second
 
 // ClusterEvent is a cluster membership change recorded in the event log.
 type ClusterEvent struct {
@@ -81,11 +87,16 @@ type Config struct {
 	Store          *store.Store      // shared store reference
 	Ring           hashring.Hashring // shared hashring reference
 	ReplicaRF      int               // replication factor (number of replicas per key)
+	WriteConcern   int               // minimum replicas that must ACK a write (1 to ReplicaRF)
 	Discoverer     Discoverer        // seed discovery
 	AntiEntropySec int               // anti-entropy interval in seconds (default 30)
 	TLSConfig      *tls.Config       // optional mTLS config
 	Transport      GossipTransport   // transport impl (nil = memberlist)
 	Clock          Clock             // clock impl (nil = wall clock)
+}
+
+type ackResult struct {
+	err error
 }
 
 // Handler wraps a GossipTransport and implements data replication via gossip.
@@ -99,6 +110,9 @@ type Handler struct {
 	subMu     sync.RWMutex
 	subNext   int
 	subscribers map[int]chan ClusterEvent
+
+	pendingMu   sync.Mutex
+	pendingReqs map[string]chan ackResult
 }
 
 // PushEvent records an event in the ring buffer and fans it out to SSE subscribers.
@@ -136,7 +150,6 @@ func (h *Handler) RecentEvents(n int) []ClusterEvent {
 
 // New creates a gossip handler. Call Start() to begin.
 func New(cfg Config) *Handler {
-	// Default transport is memberlist if none set.
 	transport := cfg.Transport
 	if transport == nil {
 		transport = NewMemberlistTransport()
@@ -147,6 +160,11 @@ func New(cfg Config) *Handler {
 		clock = wallClock{}
 	}
 
+	// Default write concern: write to all replicas.
+	if cfg.WriteConcern <= 0 || cfg.WriteConcern > cfg.ReplicaRF {
+		cfg.WriteConcern = cfg.ReplicaRF
+	}
+
 	return &Handler{
 		cfg:         cfg,
 		transport:   transport,
@@ -154,6 +172,7 @@ func New(cfg Config) *Handler {
 		stopCh:      make(chan struct{}),
 		events:      newEventRing(eventRingSize),
 		subscribers: make(map[int]chan ClusterEvent),
+		pendingReqs: make(map[string]chan ackResult),
 	}
 }
 
@@ -163,7 +182,6 @@ func (h *Handler) Start() error {
 		h.cfg.AntiEntropySec = 30
 	}
 
-	// Set up callbacks from transport → gossip handler
 	h.transport.SetHandlers(TransportHandlers{
 		OnMessage:         h.handleMessage,
 		OnJoin:            h.handleJoin,
@@ -173,7 +191,6 @@ func (h *Handler) Start() error {
 		OnMergeRemoteState: h.handleMergeRemoteState,
 	})
 
-	// Start the transport (binds ports, creates memberlist, etc.)
 	tCfg := TransportConfig{
 		NodeID:    h.cfg.NodeID,
 		BindAddr:  h.cfg.BindAddr,
@@ -185,7 +202,6 @@ func (h *Handler) Start() error {
 		return err
 	}
 
-	// Join the cluster via discoverer
 	if h.cfg.Discoverer != nil {
 		seeds, err := h.cfg.Discoverer.Discover()
 		if err != nil {
@@ -198,25 +214,32 @@ func (h *Handler) Start() error {
 				log.Printf("gossip: joined cluster")
 			}
 		}
-		// Retry join in background until we see at least one peer.
 		go h.retryJoin(seeds)
 	}
 
-	// Start anti-entropy loop
 	go h.antiEntropyLoop()
-
 	return nil
 }
 
-// --- transport callbacks ---
+// --- Transport callbacks ---
 
 func (h *Handler) handleMessage(from string, buf []byte) {
-	var batch pb.EntryBatch
-	if err := proto.Unmarshal(buf, &batch); err != nil {
+	var msg pb.GossipMessage
+	if err := proto.Unmarshal(buf, &msg); err != nil {
 		log.Printf("gossip: unmarshal message: %v", err)
 		return
 	}
-	h.HandleReplication(batch.Entries)
+
+	switch p := msg.Payload.(type) {
+	case *pb.GossipMessage_EntryBatch:
+		h.HandleReplication(p.EntryBatch.Entries)
+	case *pb.GossipMessage_ReplicateReq:
+		h.handleReplicateRequest(p.ReplicateReq)
+	case *pb.GossipMessage_ReplicateResp:
+		h.handleReplicateResponse(p.ReplicateResp)
+	default:
+		log.Printf("gossip: unknown message payload type")
+	}
 }
 
 func (h *Handler) handleJoin(nodeID, redisAddr string) {
@@ -249,6 +272,227 @@ func (h *Handler) handleUpdate(nodeID, redisAddr string) {
 	})
 }
 
+// --- Quorum write ---
+
+// ReplicateWithQuorum writes the key locally and synchronously replicates to
+// enough remote replicas to satisfy w (write concern). Returns nil on success
+// or an error if quorum cannot be reached within the timeout.
+// w must be in [1, ReplicaRF].
+func (h *Handler) ReplicateWithQuorum(key, value string, version int64, w int) error {
+	// Always apply locally first.
+	h.cfg.Store.SetWithVersion(key, value, version)
+
+	if w <= 1 {
+		return nil
+	}
+
+	replicas := h.cfg.Ring.GetReplicas(key, h.cfg.ReplicaRF)
+
+	// Collect remote nodes.
+	var remoteNodes []hashring.Replica
+	for _, r := range replicas {
+		if r.NodeID == h.NodeID() {
+			continue
+		}
+		remoteNodes = append(remoteNodes, r)
+	}
+
+	// If we're the only node or no remote replicas, local counts as all.
+	if len(remoteNodes) == 0 {
+		return nil
+	}
+
+	// Build request with correlation ID.
+	requestID := uuid.New().String()
+	req := &pb.GossipMessage{
+		Payload: &pb.GossipMessage_ReplicateReq{
+			ReplicateReq: &pb.ReplicateRequest{
+				RequestId: requestID,
+				SenderId:  h.NodeID(),
+				Entries:   []*pb.Entry{{Key: key, Value: value, Version: version}},
+			},
+		},
+	}
+	reqBuf, err := proto.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal replicate request: %w", err)
+	}
+
+	// Correlate ACKs.
+	ch := make(chan ackResult, len(remoteNodes))
+	h.pendingMu.Lock()
+	h.pendingReqs[requestID] = ch
+	h.pendingMu.Unlock()
+
+	defer func() {
+		h.pendingMu.Lock()
+		delete(h.pendingReqs, requestID)
+		h.pendingMu.Unlock()
+	}()
+
+	// Send to each remote replica.
+	sent := 0
+	for _, r := range remoteNodes {
+		if err := h.transport.SendReliable(r.NodeID, reqBuf); err != nil {
+			log.Printf("gossip: replicate to %s: %v", r.NodeID, err)
+			continue
+		}
+		sent++
+	}
+	if sent == 0 {
+		return fmt.Errorf("replication: no remote replicas reachable")
+	}
+
+	// Wait for enough ACKs (including local).
+	acks := 1 // local node
+	deadline := time.After(DefaultReplicateTimeout)
+
+	for acks < w && acks <= sent {
+		select {
+		case res := <-ch:
+			if res.err == nil {
+				acks++
+			}
+		case <-deadline:
+			return fmt.Errorf("quorum not reached: %d/%d ACKs after %v", acks, w, DefaultReplicateTimeout)
+		}
+	}
+
+	return nil
+}
+
+// --- Replication handlers ---
+
+// handleReplicateRequest applies entries from a quorum write request and
+// sends an ACK back to the sender.
+func (h *Handler) handleReplicateRequest(req *pb.ReplicateRequest) {
+	h.HandleReplication(req.Entries)
+
+	resp := &pb.GossipMessage{
+		Payload: &pb.GossipMessage_ReplicateResp{
+			ReplicateResp: &pb.ReplicateResponse{
+				RequestId: req.RequestId,
+				NodeId:    h.NodeID(),
+				Success:   true,
+			},
+		},
+	}
+	respBuf, err := proto.Marshal(resp)
+	if err != nil {
+		log.Printf("gossip: marshal ack: %v", err)
+		return
+	}
+	if err := h.transport.SendReliable(req.SenderId, respBuf); err != nil {
+		log.Printf("gossip: send ack to %s: %v", req.SenderId, err)
+	}
+}
+
+// handleReplicateResponse routes an ACK to the waiting goroutine.
+func (h *Handler) handleReplicateResponse(resp *pb.ReplicateResponse) {
+	h.pendingMu.Lock()
+	ch, ok := h.pendingReqs[resp.RequestId]
+	h.pendingMu.Unlock()
+	if !ok {
+		return
+	}
+	var err error
+	if !resp.Success {
+		err = fmt.Errorf("replica %s rejected write", resp.NodeId)
+	}
+	select {
+	case ch <- ackResult{err: err}:
+	default:
+		// channel full (already timed out or duplicate ACK)
+	}
+}
+
+// HandleReplication applies a batch of entries to the local store if this
+// node is in the ring's replica set for the key. Public for test access.
+func (h *Handler) HandleReplication(entries []*pb.Entry) {
+	for _, e := range entries {
+		replicas := h.cfg.Ring.GetReplicas(e.Key, h.cfg.ReplicaRF)
+		isReplica := false
+		for _, r := range replicas {
+			if r.NodeID == h.NodeID() {
+				isReplica = true
+				break
+			}
+		}
+		if !isReplica {
+			continue
+		}
+		// ponytail: fetch version again to avoid TOCTOU; SetWithVersion
+		// internally does the LWW check under the write lock.
+		h.cfg.Store.SetWithVersion(e.Key, e.Value, e.Version)
+	}
+}
+
+// --- Anti-entropy ---
+
+func (h *Handler) antiEntropyLoop() {
+	for {
+		select {
+		case <-h.stopCh:
+			return
+		case <-h.clock.After(time.Duration(h.cfg.AntiEntropySec) * time.Second):
+			h.exchangeState()
+		}
+	}
+}
+
+func (h *Handler) exchangeState() {
+	snapshot := h.serializeStore()
+	if snapshot == nil {
+		return
+	}
+
+	members := h.transport.Members()
+	if len(members) <= 1 {
+		return
+	}
+
+	var peers []MemberInfo
+	for _, m := range members {
+		if m.Name != h.NodeID() {
+			peers = append(peers, m)
+		}
+	}
+	if len(peers) == 0 {
+		return
+	}
+
+	peer := peers[0]
+	snapshotBuf, err := proto.Marshal(snapshot)
+	if err != nil {
+		log.Printf("gossip: marshal snapshot: %v", err)
+		return
+	}
+
+	if err := h.transport.SendReliable(peer.Name, snapshotBuf); err != nil {
+		log.Printf("gossip: anti-entropy send to %s: %v", peer.Name, err)
+	}
+}
+
+func (h *Handler) serializeStore() *pb.GossipMessage {
+	snap := h.cfg.Store.Snapshot()
+	if len(snap) == 0 {
+		return nil
+	}
+	entries := make([]*pb.Entry, 0, len(snap))
+	for k, e := range snap {
+		entries = append(entries, &pb.Entry{
+			Key:     k,
+			Value:   e.Value,
+			Version: e.Version,
+		})
+	}
+	return &pb.GossipMessage{
+		Payload: &pb.GossipMessage_EntryBatch{
+			EntryBatch: &pb.EntryBatch{Entries: entries},
+		},
+	}
+}
+
 func (h *Handler) handleLocalState() []byte {
 	snapshot := h.serializeStore()
 	if snapshot == nil {
@@ -263,15 +507,19 @@ func (h *Handler) handleLocalState() []byte {
 }
 
 func (h *Handler) handleMergeRemoteState(buf []byte) {
-	var snapshot pb.EntryBatch
-	if err := proto.Unmarshal(buf, &snapshot); err != nil {
+	var msg pb.GossipMessage
+	if err := proto.Unmarshal(buf, &msg); err != nil {
 		log.Printf("gossip: unmarshal remote state: %v", err)
 		return
 	}
-	for _, e := range snapshot.Entries {
+	batch := msg.GetEntryBatch()
+	if batch == nil {
+		return
+	}
+	for _, e := range batch.Entries {
 		h.cfg.Store.SetWithVersion(e.Key, e.Value, e.Version)
 	}
-	log.Printf("gossip: merged %d entries from anti-entropy", len(snapshot.Entries))
+	log.Printf("gossip: merged %d entries from anti-entropy", len(batch.Entries))
 }
 
 // --- retry join ---
@@ -280,7 +528,6 @@ func (h *Handler) retryJoin(seeds []string) {
 	if len(seeds) == 0 {
 		return
 	}
-	// If we already have peers on first try, nothing to do.
 	if len(h.transport.Members()) > 1 {
 		return
 	}
@@ -311,18 +558,6 @@ func (h *Handler) retryJoin(seeds []string) {
 	}
 }
 
-// Broadcast asynchronously sends a key write to the cluster.
-func (h *Handler) Broadcast(key, value string, version int64) {
-	entry := &pb.Entry{Key: key, Value: value, Version: version}
-	batch := &pb.EntryBatch{Entries: []*pb.Entry{entry}}
-	buf, err := proto.Marshal(batch)
-	if err != nil {
-		log.Printf("gossip: marshal broadcast: %v", err)
-		return
-	}
-	h.transport.Broadcast(buf, key)
-}
-
 // NodeID returns this node's ID.
 func (h *Handler) NodeID() string {
 	return h.transport.LocalNodeID()
@@ -332,91 +567,6 @@ func (h *Handler) NodeID() string {
 func (h *Handler) Leave(timeout time.Duration) error {
 	close(h.stopCh)
 	return h.transport.Leave(timeout)
-}
-
-// HandleReplication is called when the server receives a replication message.
-// Public so the server can expose it via tests.
-func (h *Handler) HandleReplication(entries []*pb.Entry) {
-	for _, e := range entries {
-		replicas := h.cfg.Ring.GetReplicas(e.Key, h.cfg.ReplicaRF)
-		isReplica := false
-		for _, r := range replicas {
-			if r.NodeID == h.NodeID() {
-				isReplica = true
-				break
-			}
-		}
-		if !isReplica {
-			continue
-		}
-		h.cfg.Store.SetWithVersion(e.Key, e.Value, e.Version)
-	}
-}
-
-// --- anti-entropy ---
-
-func (h *Handler) antiEntropyLoop() {
-	// Re-arm After each tick — works for both wallClock (time.After creates a
-	// new timer) and ManualClock (channel fires on Advance).
-	for {
-		select {
-		case <-h.stopCh:
-			return
-		case <-h.clock.After(time.Duration(h.cfg.AntiEntropySec) * time.Second):
-			h.exchangeState()
-		}
-	}
-}
-
-func (h *Handler) exchangeState() {
-	snapshot := h.serializeStore()
-	if snapshot == nil {
-		return
-	}
-
-	members := h.transport.Members()
-	if len(members) <= 1 {
-		return
-	}
-
-	// Exclude self
-	var peers []MemberInfo
-	for _, m := range members {
-		if m.Name != h.NodeID() {
-			peers = append(peers, m)
-		}
-	}
-	if len(peers) == 0 {
-		return
-	}
-
-	// Pick the first peer for this round
-	peer := peers[0]
-	snapshotBuf, err := proto.Marshal(snapshot)
-	if err != nil {
-		log.Printf("gossip: marshal snapshot: %v", err)
-		return
-	}
-
-	if err := h.transport.SendReliable(peer.Name, snapshotBuf); err != nil {
-		log.Printf("gossip: anti-entropy send to %s: %v", peer.Name, err)
-	}
-}
-
-func (h *Handler) serializeStore() *pb.EntryBatch {
-	snapshot := h.cfg.Store.Snapshot()
-	if len(snapshot) == 0 {
-		return nil
-	}
-	entries := make([]*pb.Entry, 0, len(snapshot))
-	for k, e := range snapshot {
-		entries = append(entries, &pb.Entry{
-			Key:     k,
-			Value:   e.Value,
-			Version: e.Version,
-		})
-	}
-	return &pb.EntryBatch{Entries: entries}
 }
 
 // KeyCount returns the number of keys in the local store.

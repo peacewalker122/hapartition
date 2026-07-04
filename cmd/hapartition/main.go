@@ -25,6 +25,7 @@ func main() {
 	gossipPort := flag.Int("gossip-port", 7946, "Gossip (memberlist) port")
 	gossipJoin := flag.String("join", "", "Comma-separated gossip seed addresses (host:port)")
 	replicaRF := flag.Int("rf", 2, "Replication factor")
+	writeConcern := flag.Int("w", 0, "Write concern (1 to RF, default: RF = all replicas must ACK)")
 	tlsCert := flag.String("tls-cert", "", "TLS certificate file for mTLS")
 	tlsKey := flag.String("tls-key", "", "TLS private key file for mTLS")
 	tlsCA := flag.String("tls-ca", "", "CA certificate file for verifying peer certificates")
@@ -55,6 +56,11 @@ func main() {
 		redisSrv.SetAdvertiseAddr(ringAddr)
 	}
 
+	wc := *writeConcern
+	if wc <= 0 || wc > *replicaRF {
+		wc = *replicaRF
+	}
+
 	// Create gossip handler with memberlist
 	gossipCfg := gossip.Config{
 		NodeID:         id,
@@ -64,6 +70,7 @@ func main() {
 		Store:          redisSrv.Store(),
 		Ring:           redisSrv.Ring(),
 		ReplicaRF:      *replicaRF,
+		WriteConcern:   wc,
 		AntiEntropySec: 30,
 	}
 
@@ -125,6 +132,7 @@ func main() {
 
 	// Wire gossip into the Redis server
 	redisSrv.SetGossip(g)
+	redisSrv.SetWriteConcern(wc)
 
 	// Start Redis-compatible TCP server
 	if err := redisSrv.ListenAndServe(); err != nil {

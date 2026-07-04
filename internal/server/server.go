@@ -18,15 +18,16 @@ import (
 // Server is a Redis-compatible TCP server with cluster membership tracking
 // and consistent hash ring routing.
 type Server struct {
-	addr    string
-	localID string // node ID (fallback when gossip is nil)
-	store   *store.Store
-	gossip  *gossip.Handler
-	ring    hashring.Hashring
-	ln      net.Listener
-	wg      sync.WaitGroup
-	quit    chan struct{}
-	done    chan struct{}
+	addr         string
+	localID      string // node ID (fallback when gossip is nil)
+	store        *store.Store
+	gossip       *gossip.Handler
+	ring         hashring.Hashring
+	writeConcern int // minimum replicas that must ACK a write (1 to replicaRF)
+	ln           net.Listener
+	wg           sync.WaitGroup
+	quit         chan struct{}
+	done         chan struct{}
 }
 
 // New creates a new Server with the given Redis bind address and node ID.
@@ -36,13 +37,14 @@ func New(addr, nodeID string) *Server {
 	ring.AddNode(nodeID, addr, 256)
 
 	return &Server{
-		addr:    addr,
-		localID: nodeID,
-		store:   store.New(),
-		ring:    ring,
-		gossip:  nil, // set via SetGossip
-		quit:    make(chan struct{}),
-		done:    make(chan struct{}),
+		addr:         addr,
+		localID:      nodeID,
+		store:        store.New(),
+		ring:         ring,
+		gossip:       nil, // set via SetGossip
+		writeConcern: 1,   // default: local write only, overridden via SetWriteConcern
+		quit:         make(chan struct{}),
+		done:         make(chan struct{}),
 	}
 }
 
@@ -50,6 +52,12 @@ func New(addr, nodeID string) *Server {
 // ListenAndServe if gossip features (replication, NODE.LIST) are wanted.
 func (s *Server) SetGossip(g *gossip.Handler) {
 	s.gossip = g
+}
+
+// SetWriteConcern sets the minimum number of replicas that must acknowledge
+// a write before OK is returned. Must be >= 1 and <= replication factor.
+func (s *Server) SetWriteConcern(w int) {
+	s.writeConcern = w
 }
 
 // SetAdvertiseAddr updates the local node's address in the hashring to the
@@ -199,7 +207,14 @@ func (s *Server) dispatch(wr *resp.Writer, cmd string, args []resp.Value) {
 		s.handleKeyCommand(wr, args, func(key, value string) {
 			ver := s.store.Set(key, value)
 			if s.gossip != nil && ver > 0 {
-				s.gossip.Broadcast(key, value, ver)
+				w := s.writeConcern
+				if w <= 0 {
+					w = 1
+				}
+				if err := s.gossip.ReplicateWithQuorum(key, value, ver, w); err != nil {
+					wr.WriteValue(resp.Error("ERR " + err.Error()))
+					return
+				}
 			}
 			wr.WriteValue(resp.OK)
 		})
