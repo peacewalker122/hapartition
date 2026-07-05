@@ -23,17 +23,13 @@ spec:
             - --port=6379
             - --http=8080
             - --gossip-port=7946
-            - --advertise-addr=$(POD_IP):6379
+            - --advertise-addr=$(POD_NAME).hapartition-gossip.hapartition.svc.cluster.local:6379
             - --join=hapartition-gossip:7946
             - --tls-insecure
             - --tls-cert=/etc/tls/$(POD_NAME)/tls.crt
             - --tls-key=/etc/tls/$(POD_NAME)/tls.key
             - --tls-ca=/etc/tls/$(POD_NAME)/ca.crt
           env:
-            - name: POD_IP
-              valueFrom:
-                fieldRef:
-                  fieldPath: status.podIP
             - name: POD_NAME
               valueFrom:
                 fieldRef:
