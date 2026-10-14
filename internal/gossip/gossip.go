@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"log"
+	"sort"
 	"sync"
 	"time"
 
@@ -91,12 +92,14 @@ type Config struct {
 	Discoverer     Discoverer        // seed discovery
 	AntiEntropySec int               // anti-entropy interval in seconds (default 30)
 	TLSConfig      *tls.Config       // optional mTLS config
+	SecretKey      []byte
 	Transport      GossipTransport   // transport impl (nil = memberlist)
 	Clock          Clock             // clock impl (nil = wall clock)
 }
 
 type ackResult struct {
-	err error
+	nodeID string
+	err    error
 }
 
 // Handler wraps a GossipTransport and implements data replication via gossip.
@@ -111,8 +114,10 @@ type Handler struct {
 	subNext   int
 	subscribers map[int]chan ClusterEvent
 
-	pendingMu   sync.Mutex
-	pendingReqs map[string]chan ackResult
+	pendingMu      sync.Mutex
+	pendingReqs    map[string]chan ackResult
+	antiEntropyMu  sync.Mutex
+	antiEntropyPos int
 }
 
 // PushEvent records an event in the ring buffer and fans it out to SSE subscribers.
@@ -197,6 +202,7 @@ func (h *Handler) Start() error {
 		BindPort:  h.cfg.BindPort,
 		RedisAddr: h.cfg.RedisAddr,
 		TLSConfig: h.cfg.TLSConfig,
+		SecretKey: h.cfg.SecretKey,
 	}
 	if err := h.transport.Start(tCfg); err != nil {
 		return err
@@ -278,38 +284,37 @@ func (h *Handler) handleUpdate(nodeID, redisAddr string) {
 // enough remote replicas to satisfy w (write concern). Returns nil on success
 // or an error if quorum cannot be reached within the timeout.
 // w must be in [1, ReplicaRF].
-func (h *Handler) ReplicateWithQuorum(key, value string, version int64, w int) error {
+func (h *Handler) ReplicateWithQuorum(key string, entry store.Entry, w int) error {
 	// Always apply locally first.
-	h.cfg.Store.SetWithVersion(key, value, version)
+	h.cfg.Store.SetWithVersion(key, entry)
 
 	if w <= 1 {
 		return nil
 	}
 
 	replicas := h.cfg.Ring.GetReplicas(key, h.cfg.ReplicaRF)
-
 	// Collect remote nodes.
 	var remoteNodes []hashring.Replica
-	for _, r := range replicas {
-		if r.NodeID == h.NodeID() {
-			continue
+	for _, replica := range replicas {
+		if replica.NodeID != h.NodeID() {
+			remoteNodes = append(remoteNodes, replica)
 		}
-		remoteNodes = append(remoteNodes, r)
+	}
+	if w > len(remoteNodes)+1 {
+		return fmt.Errorf("quorum not reachable: %d replicas available, need %d", len(remoteNodes)+1, w)
 	}
 
-	// If we're the only node or no remote replicas, local counts as all.
-	if len(remoteNodes) == 0 {
-		return nil
-	}
-
-	// Build request with correlation ID.
 	requestID := uuid.New().String()
+	// Build request with correlation ID.
 	req := &pb.GossipMessage{
 		Payload: &pb.GossipMessage_ReplicateReq{
 			ReplicateReq: &pb.ReplicateRequest{
 				RequestId: requestID,
 				SenderId:  h.NodeID(),
-				Entries:   []*pb.Entry{{Key: key, Value: value, Version: version}},
+				Entries: []*pb.Entry{{
+					Key: key, Value: entry.Value, Version: entry.Version,
+					Origin: entry.Origin, Deleted: entry.Deleted,
+				}},
 			},
 		},
 	}
@@ -318,47 +323,55 @@ func (h *Handler) ReplicateWithQuorum(key, value string, version int64, w int) e
 		return fmt.Errorf("marshal replicate request: %w", err)
 	}
 
-	// Correlate ACKs.
 	ch := make(chan ackResult, len(remoteNodes))
+	// Correlate ACKs.
 	h.pendingMu.Lock()
 	h.pendingReqs[requestID] = ch
 	h.pendingMu.Unlock()
-
 	defer func() {
 		h.pendingMu.Lock()
 		delete(h.pendingReqs, requestID)
 		h.pendingMu.Unlock()
 	}()
 
-	// Send to each remote replica.
 	sent := 0
-	for _, r := range remoteNodes {
-		if err := h.transport.SendReliable(r.NodeID, reqBuf); err != nil {
-			log.Printf("gossip: replicate to %s: %v", r.NodeID, err)
+	// Send to each remote replica.
+	expected := make(map[string]struct{}, len(remoteNodes))
+	for _, replica := range remoteNodes {
+		if err := h.transport.SendReliable(replica.NodeID, reqBuf); err != nil {
+			log.Printf("gossip: replicate to %s: %v", replica.NodeID, err)
 			continue
 		}
+		expected[replica.NodeID] = struct{}{}
 		sent++
 	}
-	if sent == 0 {
-		return fmt.Errorf("replication: no remote replicas reachable")
+	if sent+1 < w {
+		return fmt.Errorf("quorum not reachable: %d replicas reachable, need %d", sent+1, w)
 	}
 
+	acks := 1
 	// Wait for enough ACKs (including local).
-	acks := 1 // local node
+	acked := make(map[string]struct{}, sent)
 	deadline := time.After(DefaultReplicateTimeout)
-
-	for acks < w && acks <= sent {
+	for acks < w {
 		select {
 		case res := <-ch:
-			if res.err == nil {
-				acks++
+			if _, valid := expected[res.nodeID]; valid && res.err == nil {
+				if _, duplicate := acked[res.nodeID]; !duplicate {
+					acked[res.nodeID] = struct{}{}
+					acks++
+				}
 			}
 		case <-deadline:
 			return fmt.Errorf("quorum not reached: %d/%d ACKs after %v", acks, w, DefaultReplicateTimeout)
 		}
 	}
-
 	return nil
+}
+
+func (h *Handler) Join(address string) error {
+	_, err := h.transport.Join([]string{address})
+	return err
 }
 
 // --- Replication handlers ---
@@ -366,14 +379,29 @@ func (h *Handler) ReplicateWithQuorum(key, value string, version int64, w int) e
 // handleReplicateRequest applies entries from a quorum write request and
 // sends an ACK back to the sender.
 func (h *Handler) handleReplicateRequest(req *pb.ReplicateRequest) {
-	h.HandleReplication(req.Entries)
+	success := true
+	for _, entry := range req.Entries {
+		replicas := h.cfg.Ring.GetReplicas(entry.Key, h.cfg.ReplicaRF)
+		isReplica := false
+		for _, replica := range replicas {
+			if replica.NodeID == h.NodeID() {
+				isReplica = true
+				break
+			}
+		}
+		if !isReplica {
+			success = false
+			break
+		}
+		h.cfg.Store.SetWithVersion(entry.Key, store.Entry{
+			Value: entry.Value, Version: entry.Version, Origin: entry.Origin, Deleted: entry.Deleted,
+		})
+	}
 
 	resp := &pb.GossipMessage{
 		Payload: &pb.GossipMessage_ReplicateResp{
 			ReplicateResp: &pb.ReplicateResponse{
-				RequestId: req.RequestId,
-				NodeId:    h.NodeID(),
-				Success:   true,
+				RequestId: req.RequestId, NodeId: h.NodeID(), Success: success,
 			},
 		},
 	}
@@ -400,7 +428,7 @@ func (h *Handler) handleReplicateResponse(resp *pb.ReplicateResponse) {
 		err = fmt.Errorf("replica %s rejected write", resp.NodeId)
 	}
 	select {
-	case ch <- ackResult{err: err}:
+	case ch <- ackResult{nodeID: resp.NodeId, err: err}:
 	default:
 		// channel full (already timed out or duplicate ACK)
 	}
@@ -423,7 +451,9 @@ func (h *Handler) HandleReplication(entries []*pb.Entry) {
 		}
 		// ponytail: fetch version again to avoid TOCTOU; SetWithVersion
 		// internally does the LWW check under the write lock.
-		h.cfg.Store.SetWithVersion(e.Key, e.Value, e.Version)
+		h.cfg.Store.SetWithVersion(e.Key, store.Entry{
+			Value: e.Value, Version: e.Version, Origin: e.Origin, Deleted: e.Deleted,
+		})
 	}
 }
 
@@ -460,8 +490,12 @@ func (h *Handler) exchangeState() {
 	if len(peers) == 0 {
 		return
 	}
-
-	peer := peers[0]
+	sort.Slice(peers, func(i, j int) bool { return peers[i].Name < peers[j].Name })
+	h.antiEntropyMu.Lock()
+	index := h.antiEntropyPos % len(peers)
+	peer := peers[index]
+	h.antiEntropyPos = (index + 1) % len(peers)
+	h.antiEntropyMu.Unlock()
 	snapshotBuf, err := proto.Marshal(snapshot)
 	if err != nil {
 		log.Printf("gossip: marshal snapshot: %v", err)
@@ -481,9 +515,7 @@ func (h *Handler) serializeStore() *pb.GossipMessage {
 	entries := make([]*pb.Entry, 0, len(snap))
 	for k, e := range snap {
 		entries = append(entries, &pb.Entry{
-			Key:     k,
-			Value:   e.Value,
-			Version: e.Version,
+			Key: k, Value: e.Value, Version: e.Version, Origin: e.Origin, Deleted: e.Deleted,
 		})
 	}
 	return &pb.GossipMessage{
@@ -516,9 +548,7 @@ func (h *Handler) handleMergeRemoteState(buf []byte) {
 	if batch == nil {
 		return
 	}
-	for _, e := range batch.Entries {
-		h.cfg.Store.SetWithVersion(e.Key, e.Value, e.Version)
-	}
+	h.HandleReplication(batch.Entries)
 	log.Printf("gossip: merged %d entries from anti-entropy", len(batch.Entries))
 }
 

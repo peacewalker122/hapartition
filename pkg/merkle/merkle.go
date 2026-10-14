@@ -50,7 +50,7 @@ func Build(st *store.Store, numLeaves int) *Tree {
 	buckets := make([][]kv, nl)
 	st.Iterate(func(key string, e store.Entry) bool {
 		h := hashKey(key)
-		idx := int(h / (maxUint64 / uint64(nl) + 1))
+		idx := int(h / (maxUint64/uint64(nl) + 1))
 		if idx >= nl {
 			idx = nl - 1
 		}
@@ -145,12 +145,15 @@ func LeafEntries(st *store.Store, numLeaves, leafIdx int) []store.Entry {
 	var entries []store.Entry
 	st.Iterate(func(key string, e store.Entry) bool {
 		h := hashKey(key)
-		if h >= start && h < end {
+		if inLeafRange(h, start, end, leafIdx == numLeaves-1) {
 			entries = append(entries, e)
 		}
 		return true
 	})
 	return entries
+}
+func inLeafRange(hash, start, end uint64, final bool) bool {
+	return hash >= start && (hash < end || final && hash == maxUint64)
 }
 
 // --- internal types and helpers ---

@@ -5,8 +5,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/peacewalker122/hapartition/internal/gossip/pb"
 	"github.com/peacewalker122/hapartition/internal/hashring"
 	"github.com/peacewalker122/hapartition/pkg/store"
+	"google.golang.org/protobuf/proto"
 )
 
 // ─── ManualClock ────────────────────────────────────────────────────────────
@@ -341,7 +343,7 @@ func replicateAndDeliver(t *testing.T, h *Handler, key, value string, version in
 	t.Helper()
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- h.ReplicateWithQuorum(key, value, version, w)
+		errCh <- h.ReplicateWithQuorum(key, store.Entry{Value: value, Version: version, Origin: h.NodeID()}, w)
 	}()
 
 	deadline := time.After(3 * time.Second)
@@ -446,7 +448,7 @@ func TestQuorumWriteW1(t *testing.T) {
 	crossConnect(n1, n2)
 
 	// W=1: only local write confirmed, no remote replication.
-	if err := n1.Handler.ReplicateWithQuorum("key", "val", 1, 1); err != nil {
+	if err := n1.Handler.ReplicateWithQuorum("key", store.Entry{Value: "val", Version: 1, Origin: n1.Handler.NodeID()}, 1); err != nil {
 		t.Fatalf("W=1 write failed: %v", err)
 	}
 
@@ -472,7 +474,7 @@ func TestQuorumWriteMissedThenAntiEntropy(t *testing.T) {
 	})
 
 	// Write v2 with W=1 (since W=2 would timeout under partition).
-	if err := n1.Handler.ReplicateWithQuorum("k", "v2", 2, 1); err != nil {
+	if err := n1.Handler.ReplicateWithQuorum("k", store.Entry{Value: "v2", Version: 2, Origin: n1.Handler.NodeID()}, 1); err != nil {
 		t.Fatalf("W=1 write failed: %v", err)
 	}
 	// n2 still has v1.
@@ -509,8 +511,7 @@ func TestQuorumWriteFullSyncAfterPartition(t *testing.T) {
 	// Write 5 more keys with W=1 (partitioned).
 	for i := 10; i < 15; i++ {
 		key := string(rune('a' + i))
-		n1.Store.Set(key, "v2")
-		if err := n1.Handler.ReplicateWithQuorum(key, "v2", int64(i+1), 1); err != nil {
+		if err := n1.Handler.ReplicateWithQuorum(key, store.Entry{Value: "v2", Version: int64(i + 1), Origin: n1.Handler.NodeID()}, 1); err != nil {
 			t.Fatalf("W=1 write %s: %v", key, err)
 		}
 	}
@@ -596,10 +597,10 @@ func TestQuorumWriteConvergenceAfterPartition(t *testing.T) {
 	})
 
 	// Both sides write with W=1 during partition.
-	if err := n1.Handler.ReplicateWithQuorum("k", "v2", 2, 1); err != nil {
+	if err := n1.Handler.ReplicateWithQuorum("k", store.Entry{Value: "v2", Version: 2, Origin: n1.Handler.NodeID()}, 1); err != nil {
 		t.Fatalf("n1 write: %v", err)
 	}
-	if err := n2.Handler.ReplicateWithQuorum("other", "x", 10, 1); err != nil {
+	if err := n2.Handler.ReplicateWithQuorum("other", store.Entry{Value: "x", Version: 10, Origin: n2.Handler.NodeID()}, 1); err != nil {
 		t.Fatalf("n2 write: %v", err)
 	}
 
@@ -652,7 +653,7 @@ func TestQuorumWriteTimeout(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- n1.Handler.ReplicateWithQuorum("key", "val", 1, 2)
+		errCh <- n1.Handler.ReplicateWithQuorum("key", store.Entry{Value: "val", Version: 1, Origin: n1.Handler.NodeID()}, 2)
 	}()
 
 	// Deliver request to n2; ACK from n2 is blocked by partition.
@@ -673,5 +674,147 @@ func TestQuorumWriteTimeout(t *testing.T) {
 		default:
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func TestQuorumFailsWhenReplicaSetTooSmall(t *testing.T) {
+	clock := NewManualClock()
+	n := startSimNode(t, "n1", "127.0.0.1:6379", NewMessageBus(), clock)
+	err := n.Handler.ReplicateWithQuorum("key", store.Entry{
+		Value: "value", Version: 1, Origin: n.Handler.NodeID(),
+	}, 2)
+	if err == nil {
+		t.Fatal("expected quorum error when only one replica is available")
+	}
+}
+
+func TestAntiEntropyRotatesPeers(t *testing.T) {
+	clock := NewManualClock()
+	bus := NewMessageBus()
+	n1 := startSimNode(t, "n1", "127.0.0.1:6379", bus, clock)
+	startSimNode(t, "n2", "127.0.0.2:6379", bus, clock)
+	startSimNode(t, "n3", "127.0.0.3:6379", bus, clock)
+	n1.Store.SetFrom("key", "value", n1.Handler.NodeID())
+
+	n1.Handler.exchangeState()
+	n1.Handler.exchangeState()
+	bus.mu.Lock()
+	defer bus.mu.Unlock()
+	if len(bus.pending) != 2 || bus.pending[0].To == bus.pending[1].To {
+		t.Fatalf("expected consecutive anti-entropy sends to different peers, got %#v", bus.pending)
+	}
+}
+
+func TestNonReplicaRejectsReplication(t *testing.T) {
+	clock := NewManualClock()
+	bus := NewMessageBus()
+	n1 := startSimNode(t, "n1", "127.0.0.1:6379", bus, clock)
+	n2 := startSimNode(t, "n2", "127.0.0.2:6379", bus, clock)
+	n3 := startSimNode(t, "n3", "127.0.0.3:6379", bus, clock)
+	crossConnect(n1, n2, n3)
+
+	key := ""
+	for i := range 10000 {
+		candidate := string(rune('a' + i))
+		replicas := n2.Ring.GetReplicas(candidate, 2)
+		isReplica := false
+		for _, replica := range replicas {
+			if replica.NodeID == n2.Handler.NodeID() {
+				isReplica = true
+			}
+		}
+		if !isReplica {
+			key = candidate
+			break
+		}
+	}
+	if key == "" {
+		t.Fatal("could not find key outside n2 replica set")
+	}
+
+	acks := make(chan ackResult, 1)
+	n1.Handler.pendingMu.Lock()
+	n1.Handler.pendingReqs["request"] = acks
+	n1.Handler.pendingMu.Unlock()
+	n2.Handler.handleReplicateRequest(&pb.ReplicateRequest{
+		RequestId: "request",
+		SenderId:  n1.Handler.NodeID(),
+		Entries:   []*pb.Entry{{Key: key, Value: "value", Version: 1}},
+	})
+	bus.DeliverAll()
+	bus.DrainInbox()
+	if res := <-acks; res.err == nil {
+		t.Fatal("expected non-replica rejection")
+	}
+	if _, _, ok := n2.Store.Get(key); ok {
+		t.Fatal("non-replica applied replicated value")
+	}
+}
+
+func TestAntiEntropyMergeHonorsReplicaOwnership(t *testing.T) {
+	clock := NewManualClock()
+	bus := NewMessageBus()
+	n1 := startSimNode(t, "n1", "127.0.0.1:6379", bus, clock)
+	n2 := startSimNode(t, "n2", "127.0.0.2:6379", bus, clock)
+	n3 := startSimNode(t, "n3", "127.0.0.3:6379", bus, clock)
+	crossConnect(n1, n2, n3)
+
+	var replicaValueKey, replicaTombstoneKey, nonReplicaValueKey, nonReplicaTombstoneKey string
+	for i := range 10000 {
+		key := string(rune('a' + i))
+		replicas := n2.Ring.GetReplicas(key, 2)
+		isReplica := false
+		for _, replica := range replicas {
+			if replica.NodeID == n2.Handler.NodeID() {
+				isReplica = true
+				break
+			}
+		}
+		if isReplica {
+			if replicaValueKey == "" {
+				replicaValueKey = key
+			} else if replicaTombstoneKey == "" {
+				replicaTombstoneKey = key
+			}
+		} else if nonReplicaValueKey == "" {
+			nonReplicaValueKey = key
+		} else if nonReplicaTombstoneKey == "" {
+			nonReplicaTombstoneKey = key
+		}
+		if replicaValueKey != "" && replicaTombstoneKey != "" && nonReplicaValueKey != "" && nonReplicaTombstoneKey != "" {
+			break
+		}
+	}
+	if replicaValueKey == "" || replicaTombstoneKey == "" || nonReplicaValueKey == "" || nonReplicaTombstoneKey == "" {
+		t.Fatal("could not find keys in and outside n2 replica set")
+	}
+
+	n2.Store.SetWithVersion(replicaValueKey, store.Entry{Value: "old", Version: 1})
+	n2.Store.SetWithVersion(replicaTombstoneKey, store.Entry{Value: "old", Version: 1})
+	msg := &pb.GossipMessage{
+		Payload: &pb.GossipMessage_EntryBatch{EntryBatch: &pb.EntryBatch{Entries: []*pb.Entry{
+			{Key: nonReplicaValueKey, Value: "rejected", Version: 2},
+			{Key: nonReplicaTombstoneKey, Value: "rejected", Version: 2, Deleted: true},
+			{Key: replicaValueKey, Value: "new", Version: 2},
+			{Key: replicaTombstoneKey, Version: 2, Deleted: true},
+		}}},
+	}
+	buf, err := proto.Marshal(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n2.Handler.handleMergeRemoteState(buf)
+
+	if _, _, ok := n2.Store.Get(nonReplicaValueKey); ok {
+		t.Fatal("non-replica acquired anti-entropy value")
+	}
+	if _, ok := n2.Store.Snapshot()[nonReplicaTombstoneKey]; ok {
+		t.Fatal("non-replica acquired anti-entropy tombstone")
+	}
+	if value, version, ok := n2.Store.Get(replicaValueKey); !ok || value != "new" || version != 2 {
+		t.Fatalf("replica did not merge newer value: %q, %d, %t", value, version, ok)
+	}
+	if entry := n2.Store.Snapshot()[replicaTombstoneKey]; !entry.Deleted || entry.Version != 2 {
+		t.Fatalf("replica did not merge newer tombstone: %#v", entry)
 	}
 }

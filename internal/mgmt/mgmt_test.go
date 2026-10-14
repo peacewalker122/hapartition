@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
@@ -17,6 +18,11 @@ import (
 
 // startTestMgmt creates a mgmt server with a minimal gossip handler for testing.
 func startTestMgmt(t *testing.T) (baseURL string, cleanup func()) {
+	t.Helper()
+	return startTestMgmtWithToken(t, "")
+}
+
+func startTestMgmtWithToken(t *testing.T, token string) (baseURL string, cleanup func()) {
 	t.Helper()
 
 	st := store.New()
@@ -39,6 +45,7 @@ func startTestMgmt(t *testing.T) (baseURL string, cleanup func()) {
 	}
 
 	s := New("127.0.0.1:0", g)
+	s.SetAuthToken(token)
 	err := s.ListenAndServe()
 	if err != nil {
 		t.Fatalf("mgmt listen: %v", err)
@@ -86,10 +93,85 @@ func TestJoinEndpoint(t *testing.T) {
 	baseURL, cleanup := startTestMgmt(t)
 	defer cleanup()
 
-	resp := httpPost(t, baseURL+"/join", `{"address":"10.0.0.1:7946"}`)
+	resp := httpGet(t, baseURL+"/info")
+	var info infoResponse
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		t.Fatalf("decode info: %v", err)
+	}
+	resp.Body.Close()
+	if len(info.Members) != 1 {
+		t.Fatalf("expected one member, got %d", len(info.Members))
+	}
+	if host, port, err := net.SplitHostPort(info.Members[0].GossipAddr); err != nil || host == "" || port == "" {
+		t.Fatalf("expected gossip_addr host:port, got %q", info.Members[0].GossipAddr)
+	}
+
+	resp = httpPost(t, baseURL+"/join", fmt.Sprintf(`{"address":%q}`, info.Members[0].GossipAddr))
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, readBody(t, resp))
 	}
+	resp.Body.Close()
+}
+
+func TestJoinFailure(t *testing.T) {
+	baseURL, cleanup := startTestMgmt(t)
+	defer cleanup()
+
+	resp := httpPost(t, baseURL+"/join", `{"address":"no-such-host.invalid:7946"}`)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("expected 502, got %d: %s", resp.StatusCode, readBody(t, resp))
+	}
+	resp.Body.Close()
+}
+
+func TestManagementAuth(t *testing.T) {
+	baseURL, cleanup := startTestMgmtWithToken(t, "secret-token")
+	defer cleanup()
+
+	resp := httpGet(t, baseURL+"/info")
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without credentials, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	req, err := http.NewRequest(http.MethodGet, baseURL+"/info", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.SetBasicAuth("ignored", "wrong-token")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with wrong token, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	req, err = http.NewRequest(http.MethodGet, baseURL+"/info", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.SetBasicAuth("ignored", "secret-token")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 with token, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+func TestReadyzUnauthenticated(t *testing.T) {
+	baseURL, cleanup := startTestMgmtWithToken(t, "secret-token")
+	defer cleanup()
+
+	resp := httpGet(t, baseURL+"/readyz")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for live local member, got %d: %s", resp.StatusCode, readBody(t, resp))
+	}
+	resp.Body.Close()
 }
 
 func TestJoinBadRequest(t *testing.T) {
@@ -100,6 +182,7 @@ func TestJoinBadRequest(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", resp.StatusCode)
 	}
+	resp.Body.Close()
 }
 
 func TestInfoEndpoint(t *testing.T) {

@@ -18,15 +18,14 @@ spec:
       protocol: TCP
 
 ---
-# NodePort service — external access via minikube.
-# minikube service tunnels directly to pods, no LoadBalancer needed.
+# Internal Redis and HTTP access. Use kubectl port-forward for local access.
 apiVersion: v1
 kind: Service
 metadata:
   name: hapartition
   namespace: hapartition
 spec:
-  type: NodePort
+  type: ClusterIP
   selector:
     app: hapartition
   ports:

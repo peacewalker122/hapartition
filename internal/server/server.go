@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"fmt"
 	"log"
 	"net"
@@ -11,7 +13,7 @@ import (
 
 	"github.com/peacewalker122/hapartition/internal/gossip"
 	"github.com/peacewalker122/hapartition/internal/hashring"
-	"github.com/peacewalker122/hapartition/pkg/api"
+	resp "github.com/peacewalker122/hapartition/pkg/api"
 	"github.com/peacewalker122/hapartition/pkg/store"
 )
 
@@ -19,15 +21,17 @@ import (
 // and consistent hash ring routing.
 type Server struct {
 	addr         string
-	localID      string // node ID (fallback when gossip is nil)
+	localID      string
 	store        *store.Store
 	gossip       *gossip.Handler
 	ring         hashring.Hashring
-	writeConcern int // minimum replicas that must ACK a write (1 to replicaRF)
+	writeConcern int
+	authToken    string
 	ln           net.Listener
 	wg           sync.WaitGroup
 	quit         chan struct{}
 	done         chan struct{}
+	shutdownOnce sync.Once
 }
 
 // New creates a new Server with the given Redis bind address and node ID.
@@ -58,6 +62,10 @@ func (s *Server) SetGossip(g *gossip.Handler) {
 // a write before OK is returned. Must be >= 1 and <= replication factor.
 func (s *Server) SetWriteConcern(w int) {
 	s.writeConcern = w
+}
+
+func (s *Server) SetAuthToken(token string) {
+	s.authToken = token
 }
 
 // SetAdvertiseAddr updates the local node's address in the hashring to the
@@ -100,10 +108,12 @@ func (s *Server) acceptLoop() {
 
 // Shutdown gracefully stops the server.
 func (s *Server) Shutdown(ctx context.Context) error {
-	close(s.quit)
-	if s.ln != nil {
-		s.ln.Close()
-	}
+	s.shutdownOnce.Do(func() {
+		close(s.quit)
+		if s.ln != nil {
+			s.ln.Close()
+		}
+	})
 
 	doneCh := make(chan struct{})
 	go func() {
@@ -163,9 +173,9 @@ func (s *Server) Addr() string {
 func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
 	defer s.wg.Done()
-
 	rd := resp.NewReader(conn)
 	wr := resp.NewWriter(conn)
+	authenticated := s.authToken == ""
 
 	for {
 		v, err := rd.ReadValue()
@@ -189,8 +199,33 @@ func (s *Server) handleConn(conn net.Conn) {
 			continue
 		}
 
+		command := strings.ToUpper(string(name.Data))
 		args := cmd[1:]
-		s.dispatch(wr, strings.ToUpper(string(name.Data)), args)
+		if command == "AUTH" {
+			if s.authToken == "" {
+				wr.WriteValue(resp.Error("ERR AUTH called without any password configured"))
+				continue
+			}
+			if len(args) != 1 {
+				wr.WriteValue(resp.Error("ERR wrong number of arguments for 'AUTH' command"))
+				continue
+			}
+			token, ok := getBulkString(args[0])
+			got := sha256.Sum256([]byte(token))
+			want := sha256.Sum256([]byte(s.authToken))
+			if !ok || subtle.ConstantTimeCompare(got[:], want[:]) != 1 {
+				wr.WriteValue(resp.Error("WRONGPASS invalid username-password pair or user is disabled."))
+				continue
+			}
+			authenticated = true
+			wr.WriteValue(resp.OK)
+			continue
+		}
+		if !authenticated {
+			wr.WriteValue(resp.Error("NOAUTH Authentication required."))
+			continue
+		}
+		s.dispatch(wr, command, args)
 	}
 }
 
@@ -202,16 +237,15 @@ func (s *Server) dispatch(wr *resp.Writer, cmd string, args []resp.Value) {
 	case "INFO":
 		info := s.buildInfo()
 		wr.WriteValue(resp.NewBulkString(info))
-
 	case "SET":
-		s.handleKeyCommand(wr, args, func(key, value string) {
-			ver := s.store.Set(key, value)
-			if s.gossip != nil && ver > 0 {
+		s.handleKeyCommand(wr, "SET", 2, args, func(key, value string) {
+			entry := s.store.SetFrom(key, value, s.nodeID())
+			if s.gossip != nil {
 				w := s.writeConcern
 				if w <= 0 {
 					w = 1
 				}
-				if err := s.gossip.ReplicateWithQuorum(key, value, ver, w); err != nil {
+				if err := s.gossip.ReplicateWithQuorum(key, entry, w); err != nil {
 					wr.WriteValue(resp.Error("ERR " + err.Error()))
 					return
 				}
@@ -220,7 +254,7 @@ func (s *Server) dispatch(wr *resp.Writer, cmd string, args []resp.Value) {
 		})
 
 	case "GET":
-		s.handleKeyCommand(wr, args, func(key, _ string) {
+		s.handleKeyCommand(wr, "GET", 1, args, func(key, _ string) {
 			val, _, ok := s.store.Get(key)
 			if !ok {
 				wr.WriteValue(resp.NullBulkString())
@@ -243,9 +277,27 @@ func (s *Server) dispatch(wr *resp.Writer, cmd string, args []resp.Value) {
 			}
 			keys = append(keys, key)
 		}
-		n := s.store.Del(keys...)
+		for _, key := range keys {
+			ownerNode, ownerAddr := s.ring.GetNode(key)
+			if ownerNode != "" && ownerNode != s.nodeID() {
+				wr.WriteValue(resp.Error(fmt.Sprintf("MOVED %s", ownerAddr)))
+				return
+			}
+		}
+		n, tombstones := s.store.Del(s.nodeID(), keys...)
+		if s.gossip != nil {
+			w := s.writeConcern
+			if w <= 0 {
+				w = 1
+			}
+			for key, entry := range tombstones {
+				if err := s.gossip.ReplicateWithQuorum(key, entry, w); err != nil {
+					wr.WriteValue(resp.Error("ERR " + err.Error()))
+					return
+				}
+			}
+		}
 		wr.WriteValue(resp.Integer(n))
-
 	case "NODE.JOIN":
 		// With memberlist, cluster membership is handled automatically via
 		// gossip discovery. NODE.JOIN is kept for backwards compatibility —
@@ -302,9 +354,9 @@ func (s *Server) dispatch(wr *resp.Writer, cmd string, args []resp.Value) {
 // handleKeyCommand checks the hashring for the first key argument. If the key
 // belongs to a different node, it sends a MOVED error. Otherwise it executes
 // the provided fn with the key (and value for SET).
-func (s *Server) handleKeyCommand(wr *resp.Writer, args []resp.Value, fn func(key, value string)) {
-	if len(args) < 1 {
-		wr.WriteValue(resp.Error("ERR wrong number of arguments for 'SET' command"))
+func (s *Server) handleKeyCommand(wr *resp.Writer, cmd string, arity int, args []resp.Value, fn func(key, value string)) {
+	if len(args) != arity {
+		wr.WriteValue(resp.Error(fmt.Sprintf("ERR wrong number of arguments for '%s' command", cmd)))
 		return
 	}
 	key, ok := getBulkString(args[0])
@@ -322,7 +374,7 @@ func (s *Server) handleKeyCommand(wr *resp.Writer, args []resp.Value, fn func(ke
 	}
 
 	var value string
-	if len(args) >= 2 {
+	if arity == 2 {
 		v, ok := getBulkString(args[1])
 		if !ok {
 			wr.WriteValue(resp.Error("ERR invalid value"))

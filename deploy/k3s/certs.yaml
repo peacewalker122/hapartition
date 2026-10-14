@@ -15,6 +15,8 @@ spec:
   secretName: hapartition-0-tls
   commonName: hapartition-0
   dnsNames:
+    - hapartition
+    - hapartition-0
     - hapartition-0.hapartition.svc.cluster.local
     - hapartition-0.hapartition-gossip.hapartition.svc.cluster.local
   issuerRef:
@@ -33,6 +35,8 @@ spec:
   secretName: hapartition-1-tls
   commonName: hapartition-1
   dnsNames:
+    - hapartition
+    - hapartition-1
     - hapartition-1.hapartition.svc.cluster.local
     - hapartition-1.hapartition-gossip.hapartition.svc.cluster.local
   issuerRef:
@@ -51,6 +55,8 @@ spec:
   secretName: hapartition-2-tls
   commonName: hapartition-2
   dnsNames:
+    - hapartition
+    - hapartition-2
     - hapartition-2.hapartition.svc.cluster.local
     - hapartition-2.hapartition-gossip.hapartition.svc.cluster.local
   issuerRef:

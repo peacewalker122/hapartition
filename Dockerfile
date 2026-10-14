@@ -21,6 +21,7 @@ FROM alpine:3.21
 RUN apk add --no-cache ca-certificates tzdata
 
 COPY --from=builder /hapartition /hapartition
+USER 10001:10001
 
 EXPOSE 6379 8080 7946
 

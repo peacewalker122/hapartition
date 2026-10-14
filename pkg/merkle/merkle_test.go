@@ -102,6 +102,22 @@ func TestLeafBounds(t *testing.T) {
 	}
 }
 
+func TestLeafRangeMaximumBoundary(t *testing.T) {
+	boundary := uint64(42)
+	if inLeafRange(boundary, 0, boundary, false) {
+		t.Fatal("ordinary leaf included exclusive end")
+	}
+	if !inLeafRange(boundary, boundary, maxUint64, true) {
+		t.Fatal("last leaf omitted adjacent boundary")
+	}
+	if !inLeafRange(maxUint64, boundary, maxUint64, true) {
+		t.Fatal("last leaf omitted MaxUint64")
+	}
+	if inLeafRange(maxUint64, boundary, maxUint64, false) {
+		t.Fatal("non-final leaf included MaxUint64 at exclusive end")
+	}
+}
+
 func TestLeafEntries(t *testing.T) {
 	st := store.New()
 	st.Set("alpha", "1")

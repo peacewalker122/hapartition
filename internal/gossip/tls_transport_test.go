@@ -9,6 +9,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"math/big"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -17,6 +18,62 @@ import (
 	"github.com/hashicorp/memberlist"
 )
 
+func TestTLSTransportBoundsStalledHandshake(t *testing.T) {
+	certFile, keyFile, caFile, cleanup := genTestCerts(t)
+	defer cleanup()
+	tlsCfg := mustTLSConfig(t, certFile, keyFile, caFile)
+
+	cfg := memberlist.DefaultLANConfig()
+	cfg.BindAddr = "127.0.0.1"
+	cfg.BindPort = 0
+	transport, err := NewTLSTransport(cfg, tlsCfg, nil)
+	if err != nil {
+		t.Fatalf("NewTLSTransport: %v", err)
+	}
+	defer transport.Shutdown()
+
+	stalled, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.BindPort))
+	if err != nil {
+		t.Fatalf("dial stalled peer: %v", err)
+	}
+	defer stalled.Close()
+	if err := stalled.SetReadDeadline(time.Now().Add(tlsHandshakeTimeout + time.Second)); err != nil {
+		t.Fatalf("set stalled peer deadline: %v", err)
+	}
+	start := time.Now()
+	if _, err := stalled.Read(make([]byte, 1)); err != nil {
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			t.Fatalf("stalled connection was not closed within %v", tlsHandshakeTimeout+time.Second)
+		}
+	} else {
+		t.Fatal("stalled connection remained open")
+	}
+	if elapsed := time.Since(start); elapsed > tlsHandshakeTimeout+time.Second {
+		t.Fatalf("stalled handshake took %v, want <= %v", elapsed, tlsHandshakeTimeout+time.Second)
+	}
+
+	raw, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.BindPort))
+	if err != nil {
+		t.Fatalf("dial verified peer: %v", err)
+	}
+	defer raw.Close()
+	client := tls.Client(raw, &tls.Config{
+		Certificates: tlsCfg.Certificates,
+		RootCAs:      tlsCfg.RootCAs,
+		ServerName:   "localhost",
+		MinVersion:   tls.VersionTLS12,
+	})
+	if err := client.Handshake(); err != nil {
+		t.Fatalf("client TLS handshake: %v", err)
+	}
+	select {
+	case server := <-transport.StreamCh():
+		server.Close()
+	case <-time.After(time.Second):
+		t.Fatal("verified TLS stream was not forwarded")
+	}
+}
+
 // TestTLSTransportEndToEnd verifies two memberlist nodes can form a cluster
 // using the TLS transport with mutual TLS.
 func TestTLSTransportEndToEnd(t *testing.T) {
@@ -24,6 +81,7 @@ func TestTLSTransportEndToEnd(t *testing.T) {
 	defer cleanup()
 
 	tlsCfg := mustTLSConfig(t, certFile, keyFile, caFile)
+	tlsCfg.ServerName = "localhost"
 
 	// Node 1
 	n1Cfg := memberlist.DefaultLANConfig()
@@ -160,6 +218,7 @@ func writeSelfSignedCert(certFile, keyFile, caFile string) error {
 		NotAfter:     time.Now().Add(24 * time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		DNSNames:     []string{"localhost", "node-1", "node-2"},
 	}
 	leafDER, err := x509.CreateCertificate(rand.Reader, leafTmpl, caTmpl, &leafKey.PublicKey, caKey)
 	if err != nil {
@@ -205,11 +264,5 @@ func mustTLSConfig(t *testing.T, certFile, keyFile, caFile string) *tls.Config {
 		ClientCAs:    caPool,
 		RootCAs:      caPool,
 		MinVersion:   tls.VersionTLS12,
-		// The test uses self-signed certs with CN=hapartition-test-node
-		// but connects to 127.0.0.1, so we skip hostname verification.
-		// Certificate chain and client cert verification still applies.
-		InsecureSkipVerify: true,
 	}
 }
-
-

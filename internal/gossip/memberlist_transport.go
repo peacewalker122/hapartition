@@ -3,6 +3,8 @@ package gossip
 import (
 	"fmt"
 	"log"
+	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -36,6 +38,7 @@ func (m *memberlistTransport) Start(cfg TransportConfig) error {
 	mlCfg.Name = cfg.NodeID
 	mlCfg.BindAddr = cfg.BindAddr
 	mlCfg.BindPort = cfg.BindPort
+	mlCfg.SecretKey = cfg.SecretKey
 	mlCfg.Delegate = m.delegate
 	mlCfg.Events = m.delegate
 	mlCfg.LogOutput = log.Default().Writer()
@@ -113,7 +116,7 @@ func (m *memberlistTransport) Members() []MemberInfo {
 		}
 		info[i] = MemberInfo{
 			Name:      nd.Name,
-			Addr:      nd.Addr.String(),
+			Addr:      net.JoinHostPort(nd.Addr.String(), strconv.Itoa(int(nd.Port))),
 			RedisAddr: redisAddr,
 			Status:    status,
 		}

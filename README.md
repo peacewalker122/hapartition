@@ -1,6 +1,6 @@
 # Hapartition
 
-A Redis-compatible TCP server with consistent hash sharding and gossip-based replication. Built for learning distributed systems — hash rings, SWIM gossip, LWW conflict resolution, and read repair.
+A Redis-compatible TCP server with consistent hash sharding and gossip-based replication. Built for learning distributed systems: hash rings, SWIM gossip, LWW conflict resolution, and anti-entropy.
 
 ```
 redis-cli -p 6379 SET mykey myvalue
@@ -11,12 +11,11 @@ redis-cli -p 6379 GET mykey
 
 - **Redis wire protocol** — `SET`, `GET`, `DEL`, `PING` via RESP (Redis Serialization Protocol)
 - **Consistent hash sharding** — Ketama-style ring with xxHash, virtual nodes, and `MOVED` redirection
-- **Gossip membership** — SWIM protocol via HashiCorp Memberlist for automatic node discovery, failure detection, and cluster membership
-- **Async replication** — key writes broadcast to all nodes via gossip; each node stores only the replicas it owns
-- **Last-writer-wins (LWW)** — every write carries a monotonic version; stale writes are silently rejected
-- **Anti-entropy** — periodic full-state sync between random peers for convergence after partitions
-- **Protobuf wire format** — gossip messages encoded with Protocol Buffers
-- **HTTP management** — `GET /info`, `POST /join` for cluster introspection
+- **Gossip membership** — SWIM protocol via HashiCorp Memberlist for node discovery, failure detection, and cluster membership
+- **Replication** — owner and replica writes carry versions and origins; tombstones preserve replicated deletions
+- **Write quorum** — `--w` controls required replica acknowledgements; default is all configured replicas
+- **Anti-entropy** — periodic full-state sync cycles across peers for convergence after partitions
+- **HTTP management** — `GET /info`, `POST /join`, ring and event endpoints; token-protected with HTTP Basic when configured
 - **Pluggable discovery** — `Discoverer` interface for seed node resolution (static list, DNS, k8s headless service)
 
 ## Architecture
@@ -51,14 +50,14 @@ graph TB
 
     subgraph Store["pkg/store"]
         S_Set["Set(key, val) → version"]
-        S_LWW["SetWithVersion(key, val, ver) → LWW compare"]
+        S_LWW["SetWithVersion(key, entry) → LWW compare"]
         S_Get["Get(key) → val"]
         S_Snap["Snapshot() → full dump"]
     end
 
     subgraph Gossip["internal/gossip"]
         G_Mlist["memberlist SWIM"]
-        G_Bcast["Broadcast (key, val, version)"]
+        G_Bcast["Reliable quorum replication (versioned entries)"]
         G_Replic["HandleReplication → store.SetWithVersion"]
         G_AE["AntiEntropy (30s loop)"]
         G_Membership["NotifyJoin / NotifyLeave → hashring update"]
@@ -123,12 +122,12 @@ commands:
 ### `internal/gossip` — Memberlist wrapper
 
 SWIM gossip via HashiCorp Memberlist. Handles:
-- **Broadcast** — when a key is written, serializes `(key, value, version)` as
-  protobuf and fan-out to all cluster members
-- **Replication** — on receive, checks `hashring.GetReplicas()` to decide if
-  this node is a replica; applies LWW merge via `store.SetWithVersion()`
-- **Anti-entropy** — every 30s picks a random peer, exchanges full store
-  snapshot, merges with LWW. Catches writes missed during partitions
+- **Quorum replication** — writes and tombstones carry version and origin; each
+  write waits for the configured number of replica acknowledgements
+- **Replication** — receivers check `hashring.GetReplicas()` then merge entries
+  by version with `store.SetWithVersion()`
+- **Anti-entropy** — every 30s cycles through peers, exchanging full snapshots
+  so missed writes and tombstones converge
 - **Membership** — `NotifyJoin`/`NotifyLeave` callbacks update the hash ring
 - **mTLS** — optional TLS transport for gossip traffic with peer verification
 
@@ -141,7 +140,7 @@ Serves alongside the Redis port on a separate listener:
 - `GET /ring` — hash ring snapshot (hex hashes per virtual node)
 - `GET /events` — recent cluster events as JSON
 - `GET /events/stream` — Server-Sent Events stream for real-time UI updates
-- `POST /join` — request to join a gossip seed address
+- `POST /join` — validates seed address, joins via gossip, reports join failures
 
 ### `internal/hashring` — Consistent hash ring
 
@@ -154,12 +153,11 @@ Binary search lookup for O(log N) key → node mapping. Supports:
 
 ### `pkg/store` — Versioned KV store
 
-In-memory key-value store with:
-- `Set(key, value)` — assigns a monotonic version counter
-- `SetWithVersion(key, value, version)` — LWW merge: rejects if stored version
-  ≥ incoming version
-- `Snapshot()` — full dump for anti-entropy exchange
-- `Del(key)` — local deletion (not replicated)
+- `Set(key, value)` — assigns a monotonic local version
+- `SetFrom(key, value, origin)` — returns a versioned entry with origin
+- `SetWithVersion(key, entry)` — LWW merge, rejects stale versions
+- `Snapshot()` — full entry dump, including deletion tombstones
+- `Del(origin, keys...)` — replicates deletions as tombstones
 
 ### `pkg/api` — RESP protocol
 
@@ -174,8 +172,13 @@ Reader and writer for the Redis Serialization Protocol:
 
 ```bash
 go build -o hapartition ./cmd/hapartition/
-./hapartition --port 6379 --http 8080
+./hapartition --port 6379 --http 8080 --rf=1 --w=1
 ```
+
+This configures single-node writes with quorum 1. The defaults (`--rf=2` and
+all-replica write concern) require a second replica; otherwise writes return a
+quorum error. Quorum is not silently lowered. The multi-node example below
+keeps these defaults.
 
 ```bash
 redis-cli -p 6379 PING
@@ -190,7 +193,7 @@ redis-cli -p 6379 GET hello
 redis-cli -p 6379 DEL hello
 # → (integer) 1
 
-curl -s http://localhost:8080/info | jq .
+curl -s http://127.0.0.1:8080/info | jq .
 ```
 
 ### Multi-node cluster
@@ -225,26 +228,29 @@ redis-cli -p 6380 SET mykey value
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--node-id` | `os.Hostname()` | Unique node ID (required when running multiple nodes on the same machine) |
+| `--bind` | `127.0.0.1` | Redis and HTTP listener host; non-loopback bind requires `HAPARTITION_AUTH_TOKEN` |
+| `--gossip-bind-address` | `127.0.0.1` | Gossip listener host; non-loopback bind requires `HAPARTITION_AUTH_TOKEN` |
 | `--port` | `6379` | Redis-compatible TCP port |
-| `--http` | `8080` | HTTP management port (GET /info, POST /join) |
+| `--http` | `8080` | HTTP management port |
 | `--gossip-port` | `7946` | Memberlist gossip port (TCP+UDP) |
 | `--join` | `""` | Comma-separated gossip seed addresses (`host:port`) |
-| `--rf` | `2` | Replication factor (number of replicas per key) |
+| `--rf` | `2` | Replication factor |
+| `--w` | `0` | Write concern; `0` means all configured replicas |
 | `--tls-cert` | `""` | TLS certificate file for mTLS gossip |
 | `--tls-key` | `""` | TLS private key file for mTLS gossip |
 | `--tls-ca` | `""` | CA certificate file for verifying peer certs (falls back to system pool) |
-| `--tls-insecure` | `false` | Skip peer certificate verification (self-signed dev certs) |
+
+`HAPARTITION_AUTH_TOKEN` enables Redis `AUTH <token>` and HTTP Basic auth
+(token is the password; username is ignored). Redis, HTTP, and gossip bind to
+loopback by default. Set a token before binding any of them to a non-loopback
+address. The same token derives the gossip shared secret.
 
 ### TLS / mTLS
 
 When `--tls-cert` and `--tls-key` are set, gossip traffic uses mutual TLS. Each
-node presents its certificate; peers verify against the CA in `--tls-ca`. If
-`--tls-insecure` is set, peer verification is skipped (useful with self-signed
-certs in development).
+node presents its certificate; peers verify against the CA in `--tls-ca`.
+The certificate SAN must include `hapartition`, used as peer `ServerName`.
 
-The node cert's SAN must include a `ServerName` value of `"hapartition"` — the
-cluster sets this on every peer connection so hostname verification passes even
-when connecting by IP.
 
 ### Discovery abstractions
 
@@ -278,15 +284,23 @@ Kubernetes cluster with cert-manager:
 | File | Purpose |
 |------|---------|
 | `namespace.yaml` | `hapartition` namespace |
-| `service.yaml` | Headless gossip service + NodePort Redis/HTTP |
+| `service.yaml` | Headless internal gossip service + ClusterIP Redis/HTTP service |
 | `ca-bootstrap.yaml` | SelfSigned issuer + CA certificate bootstrap |
 | `certs.yaml` | Per-node TLS certificates (cert-manager) |
 | `deployment.yaml` | StatefulSet with per-node cert mounts |
 
-Apply in order:
+Apply the namespace, then create required auth Secret before deploying:
 
 ```bash
 kubectl apply -f deploy/k3s/namespace.yaml
+AUTH_TOKEN="$(openssl rand -hex 32)"
+kubectl -n hapartition create secret generic hapartition-auth \
+  --from-literal=token="$AUTH_TOKEN"
+```
+
+Apply in order:
+
+```bash
 kubectl apply -f deploy/k3s/ca-bootstrap.yaml
 # wait for ClusterIssuer/internal-ca to become Ready
 kubectl wait --for=condition=Ready clusterissuer/internal-ca --timeout=60s
@@ -295,9 +309,21 @@ kubectl apply -f deploy/k3s/service.yaml
 kubectl apply -f deploy/k3s/deployment.yaml
 ```
 
+Keep this shell open so `AUTH_TOKEN` is available for the local access commands.
 Each pod gets its own TLS certificate from cert-manager, mounted at
-`/etc/tls/<pod-name>/`. Gossip traffic uses mTLS with `--tls-insecure` for
-self-signed CA (see [TLS / mTLS](#tls--mtls)).
+`/etc/tls/<pod-name>/`. Gossip traffic uses mTLS with CA verification.
+
+Redis and HTTP services are internal ClusterIP services. Access them locally
+with port-forwarding:
+
+```bash
+kubectl -n hapartition port-forward service/hapartition 6379:6379 8080:8080 >/dev/null 2>&1 &
+PORT_FORWARD_PID=$!
+trap 'kill "$PORT_FORWARD_PID"' EXIT
+sleep 1
+redis-cli -p 6379 AUTH "$AUTH_TOKEN"
+curl -u ":$AUTH_TOKEN" http://127.0.0.1:8080/info
+```
 
 ## How it works
 
@@ -312,15 +338,22 @@ Ring:   [nodeA:0] ─ [nodeB:42] ─ [nodeA:99] ─ [nodeC:150] ─ [nodeB:201] 
 
 ### Gossip replication
 
-When `SET` is called:
-1. The local store writes the value with a monotonic version (global counter)
-2. The gossip handler broadcasts `(key, value, version)` to all cluster nodes via memberlist
-3. Each receiving node checks `hashring.GetReplicas(key, rf)` — if it's one of the replica nodes, it stores with `SetWithVersion`
-4. `SetWithVersion` compares the incoming version against the stored version. If the stored version is >= the incoming version, the write is rejected (LWW)
+For `SET`, the owner writes a versioned entry locally, then sends it to replicas
+and waits for the configured acknowledgement count. The count includes the local
+write. `--w` selects the count from 1 through `--rf`; omitted or invalid values
+default to all configured replicas. If the quorum is not reached, the command
+returns an error, but the local write and writes already applied by replicas
+remain. A quorum error does not roll back writes or mean the operation aborted
+transactionally.
 
-### Anti-entropy
+`DEL` also writes versioned tombstones locally, then waits for quorum
+acknowledgements for each tombstone. Deletes that happened locally or were
+already applied by replicas remain if a quorum error occurs; `DEL` is not
+transactional.
 
-Every 30 seconds, each node picks a random peer and sends its full store snapshot as an `EntryBatch` (protobuf). The receiving node merges every entry with LWW semantics. This catches any writes missed during a node outage.
+Anti-entropy periodically syncs full store snapshots across peers in round-robin
+order. Receivers merge entries by version, including tombstones, to recover
+updates missed during outages.
 
 ### Membership
 
@@ -330,16 +363,22 @@ Memberlist handles all cluster membership:
 - **Leave** — graceful shutdown via `SIGINT`/`SIGTERM`
 - The hashring updates automatically on `NotifyJoin` and `NotifyLeave` events
 
+Memberlist delivers join and leave callbacks independently on each node. Nodes
+can therefore temporarily have different replica rings during membership
+changes. Until callbacks converge, clients can see `MOVED` redirects or quorum
+errors caused by those differing rings.
+
 ### HTTP management API
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/` | GET | Cluster dashboard (HTML with hashring viz, SSE event log) |
 | `/info` | GET | Node ID, key count, member list |
+| `/readyz` | GET | Unauthenticated readiness check; 200 only while this node is alive in gossip membership |
 | `/ring` | GET | Hash ring snapshot (hex hashes, node assignments) |
 | `/events` | GET | Recent cluster events (join, leave, key changes) |
 | `/events/stream` | GET | Server-sent events (real-time cluster updates) |
-| `/join` | POST | Join a gossip seed (`{"address":"host:port"}`) |
+| `/join` | POST | Join supplied gossip seed; returns non-success if joining fails |
 
 ## Project structure
 
@@ -363,9 +402,9 @@ cmd/hapartition/main.go     Entry point — flags, gossip setup, signal handling
 | Command | Status | Notes |
 |---------|--------|-------|
 | `PING` | ✓ | |
-| `SET key value` | ✓ | Async replication to cluster |
+| `SET key value` | ✓ | Versioned replication; waits for configured quorum acknowledgements |
 | `GET key` | ✓ | Returns value or nil |
-| `DEL key [key ...]` | ✓ | Local only (no replication) |
+| `DEL key [key ...]` | ✓ | Replicates versioned tombstones and waits for quorum acknowledgements; quorum errors do not roll back local or already-applied replica writes |
 | `INFO` | ✓ | Redis-compatible server info |
 | `CLUSTER SLOTS` | ✓ | Slot-to-node mapping for cluster-aware clients |
 | `CLUSTER NODES` | ✓ | Node list with IDs and addresses |

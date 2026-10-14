@@ -46,21 +46,22 @@ type TransportConfig struct {
 	BindPort  int
 	RedisAddr string
 	TLSConfig *tls.Config
+	SecretKey []byte
 }
 
 // TransportHandlers are callbacks set by gossip.Handler on the transport.
 type TransportHandlers struct {
 	// OnMessage is called when a gossip message arrives (broadcast or AE sync).
-	OnMessage         func(from string, buf []byte)
+	OnMessage func(from string, buf []byte)
 	// OnJoin is called when a new node joins the cluster.
-	OnJoin            func(nodeID string, redisAddr string)
+	OnJoin func(nodeID string, redisAddr string)
 	// OnLeave is called when a node leaves the cluster.
-	OnLeave           func(nodeID string)
+	OnLeave func(nodeID string)
 	// OnUpdate is called when a node's metadata changes.
-	OnUpdate          func(nodeID string, redisAddr string)
+	OnUpdate func(nodeID string, redisAddr string)
 	// OnLocalState is called when the transport needs a snapshot of local state
 	// for push-pull sync (memberlist's LocalState delegate).
-	OnLocalState      func() []byte
+	OnLocalState func() []byte
 	// OnMergeRemoteState is called when the transport receives remote state
 	// from a push-pull sync (memberlist's MergeRemoteState delegate).
 	OnMergeRemoteState func(buf []byte)

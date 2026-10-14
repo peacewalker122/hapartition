@@ -10,6 +10,8 @@ import (
 	"github.com/hashicorp/memberlist"
 )
 
+const tlsHandshakeTimeout = 5 * time.Second
+
 // TLSTransport wraps memberlist's NetTransport to add mutual TLS on TCP
 // streams. UDP packets are passed through unmodified — they carry only
 // lightweight probe/ack messages; all actual data replication (state sync,
@@ -71,10 +73,18 @@ func (t *TLSTransport) streamInterceptor() {
 				return
 			}
 			tlsConn := tls.Server(conn, t.tlsConfig)
-			// Perform handshake to verify client cert at connect time rather
-			// than letting it lazy-handshake on the first read/write.
+			if err := conn.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
+				log.Printf("tls: set server handshake deadline from %s: %v", conn.RemoteAddr(), err)
+				conn.Close()
+				continue
+			}
 			if err := tlsConn.Handshake(); err != nil {
 				log.Printf("tls: server handshake from %s: %v", conn.RemoteAddr(), err)
+				conn.Close()
+				continue
+			}
+			if err := conn.SetDeadline(time.Time{}); err != nil {
+				log.Printf("tls: clear server handshake deadline from %s: %v", conn.RemoteAddr(), err)
 				conn.Close()
 				continue
 			}

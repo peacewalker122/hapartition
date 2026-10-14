@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -20,6 +22,8 @@ import (
 
 func main() {
 	nodeID := flag.String("node-id", "", "Unique node ID (default: os.Hostname())")
+	bindHost := flag.String("bind", "127.0.0.1", "Redis and HTTP listener host")
+	gossipBindHost := flag.String("gossip-bind-address", "127.0.0.1", "Gossip listener host")
 	redisPort := flag.String("port", "6379", "Redis-compatible TCP port")
 	httpPort := flag.String("http", "8080", "HTTP management port")
 	gossipPort := flag.Int("gossip-port", 7946, "Gossip (memberlist) port")
@@ -29,9 +33,16 @@ func main() {
 	tlsCert := flag.String("tls-cert", "", "TLS certificate file for mTLS")
 	tlsKey := flag.String("tls-key", "", "TLS private key file for mTLS")
 	tlsCA := flag.String("tls-ca", "", "CA certificate file for verifying peer certificates")
-	tlsInsecure := flag.Bool("tls-insecure", false, "Skip peer certificate verification (insecure, not recommended)")
 	advertiseAddr := flag.String("advertise-addr", "", "Address advertised in MOVED redirects and gossip meta (default: :<port>)")
 	flag.Parse()
+
+	authToken := os.Getenv("HAPARTITION_AUTH_TOKEN")
+	for _, host := range []string{*bindHost, *gossipBindHost} {
+		ip := net.ParseIP(host)
+		if authToken == "" && host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+			log.Fatalf("HAPARTITION_AUTH_TOKEN is required when bind address %q is not loopback", host)
+		}
+	}
 
 	id := *nodeID
 	if id == "" {
@@ -42,16 +53,14 @@ func main() {
 		}
 	}
 
-	redisAddr := ":" + *redisPort
+	redisAddr := net.JoinHostPort(*bindHost, *redisPort)
 	ringAddr := *advertiseAddr
 	if ringAddr == "" {
 		ringAddr = redisAddr
 	}
 
-	// Create the Redis-compatible TCP server
 	redisSrv := server.New(redisAddr, id)
-	// Use the advertised address for hashring entries so MOVED redirects
-	// point to the routable pod address instead of :port
+	redisSrv.SetAuthToken(authToken)
 	if ringAddr != redisAddr {
 		redisSrv.SetAdvertiseAddr(ringAddr)
 	}
@@ -61,10 +70,9 @@ func main() {
 		wc = *replicaRF
 	}
 
-	// Create gossip handler with memberlist
 	gossipCfg := gossip.Config{
 		NodeID:         id,
-		BindAddr:       "0.0.0.0",
+		BindAddr:       *gossipBindHost,
 		BindPort:       *gossipPort,
 		RedisAddr:      ringAddr,
 		Store:          redisSrv.Store(),
@@ -72,6 +80,10 @@ func main() {
 		ReplicaRF:      *replicaRF,
 		WriteConcern:   wc,
 		AntiEntropySec: 30,
+	}
+	if authToken != "" {
+		secret := sha256.Sum256([]byte(authToken))
+		gossipCfg.SecretKey = secret[:]
 	}
 
 	// Load TLS config for mTLS gossip.
@@ -92,9 +104,6 @@ func main() {
 				log.Fatalf("tls: no certificates found in CA file")
 			}
 		} else {
-			// Use the system root pool as a fallback when no CA is specified.
-			// In mTLS, the CA is what both sides trust, so this is usually
-			// what you want when using a private CA bundle.
 			var err error
 			caPool, err = x509.SystemCertPool()
 			if err != nil {
@@ -102,27 +111,18 @@ func main() {
 			}
 		}
 
-		tlsCfg := &tls.Config{
+		gossipCfg.TLSConfig = &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			ClientAuth:   tls.RequireAndVerifyClientCert,
 			ClientCAs:    caPool,
 			RootCAs:      caPool,
 			MinVersion:   tls.VersionTLS12,
-			// memberlist connects by pod IP; set ServerName to a SAN that
-			// exists on every peer's cert so hostname verification passes.
-			ServerName: "hapartition",
+			ServerName:   "hapartition",
 		}
-		if *tlsInsecure {
-			tlsCfg.InsecureSkipVerify = true
-			tlsCfg.ClientAuth = tls.VerifyClientCertIfGiven
-		}
-		gossipCfg.TLSConfig = tlsCfg
 	}
 
-	// Set up static discoverer if --join is provided
 	if *gossipJoin != "" {
-		seeds := strings.Split(*gossipJoin, ",")
-		gossipCfg.Discoverer = &staticDiscoverer{seeds: seeds}
+		gossipCfg.Discoverer = &staticDiscoverer{seeds: strings.Split(*gossipJoin, ",")}
 	}
 
 	g, err := setupGossip(gossipCfg)
@@ -130,19 +130,25 @@ func main() {
 		log.Fatalf("gossip: %v", err)
 	}
 
-	// Wire gossip into the Redis server
 	redisSrv.SetGossip(g)
 	redisSrv.SetWriteConcern(wc)
 
-	// Start Redis-compatible TCP server
 	if err := redisSrv.ListenAndServe(); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = redisSrv.Shutdown(ctx)
+		cancel()
+		_ = g.Leave(3 * time.Second)
 		log.Fatalf("redis: %v", err)
 	}
 
-	// Start HTTP management server (shares the same gossip state)
-	httpAddr := ":" + *httpPort
+	httpAddr := net.JoinHostPort(*bindHost, *httpPort)
 	httpSrv := mgmt.New(httpAddr, g)
+	httpSrv.SetAuthToken(authToken)
 	if err := httpSrv.ListenAndServe(); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = redisSrv.Shutdown(ctx)
+		cancel()
+		_ = g.Leave(3 * time.Second)
 		log.Fatalf("http: %v", err)
 	}
 
@@ -155,17 +161,12 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Shutdown HTTP server first
 	if err := httpSrv.Shutdown(ctx); err != nil {
 		log.Printf("http shutdown error: %v", err)
 	}
-
-	// Leave gossip cluster
 	if err := g.Leave(3 * time.Second); err != nil {
 		log.Printf("gossip leave error: %v", err)
 	}
-
-	// Then shutdown Redis server
 	if err := redisSrv.Shutdown(ctx); err != nil {
 		log.Printf("redis shutdown error: %v", err)
 	}

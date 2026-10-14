@@ -7,8 +7,10 @@ message Entry {
   string key   = 1;
   string value = 2;
   int64  version = 3;
-}
+  string origin = 4;
+  bool deleted = 5;
 
+}
 // EntryBatch is used for both broadcast messages and anti-entropy snapshots.
 message EntryBatch {
   repeated Entry entries = 1;

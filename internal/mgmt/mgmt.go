@@ -2,6 +2,8 @@ package mgmt
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	_ "embed"
 	"encoding/json"
 	"fmt"
@@ -24,6 +26,7 @@ type Server struct {
 	gossip *gossip.Handler
 	srv    *http.Server
 	ln     net.Listener
+	token  string
 }
 
 // joinRequest is the JSON body for POST /join.
@@ -53,6 +56,10 @@ func New(addr string, g *gossip.Handler) *Server {
 	}
 }
 
+func (s *Server) SetAuthToken(token string) {
+	s.token = token
+}
+
 // ListenAndServe starts the HTTP listener.
 func (s *Server) ListenAndServe() error {
 	mux := http.NewServeMux()
@@ -62,10 +69,11 @@ func (s *Server) ListenAndServe() error {
 	mux.HandleFunc("/events", s.handleEvents)
 	mux.HandleFunc("/events/stream", s.handleEventStream)
 	mux.HandleFunc("/ring", s.handleRing)
+	mux.HandleFunc("/readyz", s.handleReady)
 
 	s.srv = &http.Server{
 		Addr:    s.addr,
-		Handler: mux,
+		Handler: s.auth(mux),
 	}
 
 	ln, err := net.Listen("tcp", s.addr)
@@ -95,8 +103,36 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return s.srv.Shutdown(ctx)
 }
 
-// ── Dashboard ──
+func (s *Server) auth(next http.Handler) http.Handler {
+	if s.token == "" {
+		return next
+	}
+	expected := sha256.Sum256([]byte(s.token))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, password, ok := r.BasicAuth()
+		actual := sha256.Sum256([]byte(password))
+		if r.URL.Path != "/readyz" && (!ok || subtle.ConstantTimeCompare(expected[:], actual[:]) != 1) {
+			w.Header().Set("WWW-Authenticate", `Basic realm="hapartition"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
 
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	for _, member := range s.gossip.MembersInfo() {
+		if member.Name == s.gossip.NodeID() && member.Status == "alive" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+	}
+	http.Error(w, "not ready", http.StatusServiceUnavailable)
+}
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
@@ -115,16 +151,24 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req joinRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
 		http.Error(w, fmt.Sprintf("bad request: %v", err), http.StatusBadRequest)
 		return
 	}
-	if req.Address == "" {
-		http.Error(w, "address is required", http.StatusBadRequest)
+	host, port, err := net.SplitHostPort(req.Address)
+	if err != nil || host == "" {
+		http.Error(w, "address must be host:port", http.StatusBadRequest)
+		return
+	}
+	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+		http.Error(w, "address must have a valid port", http.StatusBadRequest)
 		return
 	}
 
-	log.Printf("mgmt: joining %s via gossip", req.Address)
+	if err := s.gossip.Join(req.Address); err != nil {
+		http.Error(w, fmt.Sprintf("join failed: %v", err), http.StatusBadGateway)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintln(w, "OK")
 }
@@ -242,10 +286,10 @@ func (s *Server) handleRing(w http.ResponseWriter, r *http.Request) {
 
 	// Return as a JSON object with metadata
 	type ringResponse struct {
-		LocalNode  string               `json:"local_node"`
-		NodeCount  int                  `json:"node_count"`
-		TotalVNodes int                 `json:"total_vnodes"`
-		Entries    []hashringAPIEntry   `json:"entries"`
+		LocalNode   string             `json:"local_node"`
+		NodeCount   int                `json:"node_count"`
+		TotalVNodes int                `json:"total_vnodes"`
+		Entries     []hashringAPIEntry `json:"entries"`
 	}
 
 	// Deduplicate nodes

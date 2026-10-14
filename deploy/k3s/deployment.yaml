@@ -16,16 +16,17 @@ spec:
     spec:
       containers:
         - name: hapartition
-          image: ghcr.io/peacewalker122/hapartition:latest
+          image: ghcr.io/peacewalker122/hapartition:v3.0.1
           imagePullPolicy: IfNotPresent
           args:
+            - --bind=0.0.0.0
+            - --gossip-bind-address=0.0.0.0
             - --node-id=$(POD_NAME)
             - --port=6379
             - --http=8080
             - --gossip-port=7946
             - --advertise-addr=$(POD_NAME).hapartition-gossip.hapartition.svc.cluster.local:6379
             - --join=hapartition-gossip:7946
-            - --tls-insecure
             - --tls-cert=/etc/tls/$(POD_NAME)/tls.crt
             - --tls-key=/etc/tls/$(POD_NAME)/tls.key
             - --tls-ca=/etc/tls/$(POD_NAME)/ca.crt
@@ -34,6 +35,11 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            - name: HAPARTITION_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hapartition-auth
+                  key: token
           ports:
             - containerPort: 6379
               name: redis
@@ -50,8 +56,9 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 15
           readinessProbe:
-            tcpSocket:
-              port: redis
+            httpGet:
+              path: /readyz
+              port: http
             initialDelaySeconds: 5
             periodSeconds: 5
           volumeMounts:

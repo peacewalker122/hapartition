@@ -7,138 +7,146 @@ import (
 	"github.com/google/btree"
 )
 
-// Entry is a versioned stored value.
 type Entry struct {
 	Value   string
 	Version int64
+	Origin  string
+	Deleted bool
 }
 
-// item is the internal B-tree item, ordered by key.
 type item struct {
-	key   string
-	value string
-	ver   int64
+	key string
+	Entry
 }
 
 func less(a, b item) bool { return a.key < b.key }
 
-// Store is a goroutine-safe in-memory key-value store with versioning,
-// backed by a B-tree for ordered key traversal.
-// Every write assigns a monotonically increasing version (global counter).
-// When a write carries an explicit version, the store applies last-writer-wins
-// (LWW) semantics: if the stored version is >= the incoming version, the
-// write is silently skipped.
 type Store struct {
-	mu    sync.RWMutex
-	tree  *btree.BTreeG[item]
-	clock atomic.Int64
+	mu     sync.RWMutex
+	tree   *btree.BTreeG[item]
+	clock  atomic.Int64
+	length int
 }
 
-// New creates a new empty Store.
 func New() *Store {
-	return &Store{
-		tree:  btree.NewG[item](32, less),
-		clock: atomic.Int64{},
-	}
+	return &Store{tree: btree.NewG[item](32, less)}
 }
 
-// Set stores a value under the given key with an auto-assigned version.
-// Returns the assigned version (> 0) on success.
 func (s *Store) Set(key, value string) int64 {
-	ver := s.clock.Add(1)
-	s.mu.Lock()
-	s.tree.ReplaceOrInsert(item{key: key, value: value, ver: ver})
-	s.mu.Unlock()
-	return ver
+	return s.SetFrom(key, value, "").Version
 }
 
-// SetWithVersion stores a value with the given version.
-// If an existing entry has a version >= the given version, the write is
-// skipped (last-writer-wins). Returns true if the write was applied.
-func (s *Store) SetWithVersion(key, value string, version int64) bool {
+func (s *Store) SetFrom(key, value, origin string) Entry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	entry := Entry{Value: value, Version: s.clock.Add(1), Origin: origin}
+	old, ok := s.tree.Get(item{key: key})
+	if !ok || newer(entry, old.Entry) {
+		if !ok || old.Deleted {
+			s.length++
+		}
+		s.tree.ReplaceOrInsert(item{key: key, Entry: entry})
+	}
+	return entry
+}
 
-	existing, ok := s.tree.Get(item{key: key})
-	if ok && existing.ver >= version {
+func (s *Store) SetWithVersion(key string, entry Entry) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	old, ok := s.tree.Get(item{key: key})
+	if ok && !newer(entry, old.Entry) {
 		return false
 	}
-	s.tree.ReplaceOrInsert(item{key: key, value: value, ver: version})
-
-	// Advance clock if external version is ahead of ours.
-	if version > s.clock.Load() {
-		s.clock.Store(version)
+	if !entry.Deleted && (!ok || old.Deleted) {
+		s.length++
+	} else if ok && !old.Deleted && entry.Deleted {
+		s.length--
+	}
+	s.tree.ReplaceOrInsert(item{key: key, Entry: entry})
+	if entry.Version > s.clock.Load() {
+		s.clock.Store(entry.Version)
 	}
 	return true
 }
 
-// Get retrieves a value by key. Returns the value, its version, and whether
-// the key exists.
+func newer(a, b Entry) bool {
+	if a.Version != b.Version {
+		return a.Version > b.Version
+	}
+	if a.Origin != b.Origin {
+		return a.Origin > b.Origin
+	}
+	if a.Deleted != b.Deleted {
+		return a.Deleted
+	}
+	return a.Value > b.Value
+}
+
 func (s *Store) Get(key string) (string, int64, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	it, ok := s.tree.Get(item{key: key})
-	if !ok {
+	if !ok || it.Deleted {
 		return "", 0, false
 	}
-	return it.value, it.ver, true
+	return it.Value, it.Version, true
 }
 
-// Snapshot returns a copy of all entries in the store. Used by anti-entropy
-// to send the full state to peers.
 func (s *Store) Snapshot() map[string]Entry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	cp := make(map[string]Entry, s.tree.Len())
 	s.tree.Ascend(func(it item) bool {
-		cp[it.key] = Entry{Value: it.value, Version: it.ver}
+		cp[it.key] = it.Entry
 		return true
 	})
 	return cp
 }
 
-// Range returns all entries with keys in [start, end) in sorted order.
 func (s *Store) Range(start, end string) []Entry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	var out []Entry
-	s.tree.AscendRange(
-		item{key: start},
-		item{key: end},
-		func(it item) bool {
-			out = append(out, Entry{Value: it.value, Version: it.ver})
-			return true
-		},
-	)
+	s.tree.AscendRange(item{key: start}, item{key: end}, func(it item) bool {
+		if !it.Deleted {
+			out = append(out, it.Entry)
+		}
+		return true
+	})
 	return out
 }
 
-// Iterate calls fn for each entry in the store in sorted key order.
-// If fn returns false, iteration stops.
 func (s *Store) Iterate(fn func(key string, e Entry) bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	s.tree.Ascend(func(it item) bool {
-		return fn(it.key, Entry{Value: it.value, Version: it.ver})
+		return it.Deleted || fn(it.key, it.Entry)
 	})
 }
 
-// Len returns the number of keys in the store.
 func (s *Store) Len() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.tree.Len()
-}
+	return s.length
 
-// Del removes one or more keys and returns the number of keys actually removed.
-func (s *Store) Del(keys ...string) int {
+}
+func (s *Store) Del(origin string, keys ...string) (int, map[string]Entry) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var n int
-	for _, k := range keys {
-		if _, ok := s.tree.Delete(item{key: k}); ok {
-			n++
+	tombstones := make(map[string]Entry, len(keys))
+	for _, key := range keys {
+		if _, duplicate := tombstones[key]; duplicate {
+			continue
 		}
+		old, exists := s.tree.Get(item{key: key})
+		if exists && !old.Deleted {
+			n++
+			s.length--
+		}
+		entry := Entry{Version: s.clock.Add(1), Origin: origin, Deleted: true}
+		s.tree.ReplaceOrInsert(item{key: key, Entry: entry})
+		tombstones[key] = entry
 	}
-	return n
+	return n, tombstones
 }

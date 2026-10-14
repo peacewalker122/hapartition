@@ -125,6 +125,30 @@ func TestGetMissing(t *testing.T) {
 	}
 }
 
+func TestSetGetRequireExactArity(t *testing.T) {
+	addr, cleanup := startTestServer(t)
+	defer cleanup()
+
+	for _, tc := range []struct {
+		name, cmd, want string
+	}{
+		{"SET missing value", "*2\r\n$3\r\nSET\r\n$3\r\nkey\r\n", "-ERR wrong number of arguments for 'SET' command\r\n"},
+		{"SET extra value", "*4\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n$5\r\nextra\r\n", "-ERR wrong number of arguments for 'SET' command\r\n"},
+		{"GET missing key", "*1\r\n$3\r\nGET\r\n", "-ERR wrong number of arguments for 'GET' command\r\n"},
+		{"GET extra key", "*3\r\n$3\r\nGET\r\n$3\r\nkey\r\n$5\r\nextra\r\n", "-ERR wrong number of arguments for 'GET' command\r\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := dialResp(t, addr, tc.cmd); got != tc.want {
+				t.Fatalf("expected %q, got %q", tc.want, got)
+			}
+		})
+	}
+
+	if got := dialResp(t, addr, "*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n"); got != "$-1\r\n" {
+		t.Fatalf("extra-argument SET wrote key: GET returned %q", got)
+	}
+}
+
 func TestDel(t *testing.T) {
 	addr, cleanup := startTestServer(t)
 	defer cleanup()
@@ -151,6 +175,71 @@ func TestDelMultiple(t *testing.T) {
 	resp := dialResp(t, addr, "*4\r\n$3\r\nDEL\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nx\r\n")
 	if resp != ":2\r\n" {
 		t.Fatalf("expected :2\\r\\n, got %q", resp)
+	}
+}
+
+func TestRedisAuthRequired(t *testing.T) {
+	s := New("127.0.0.1:0", "auth-node")
+	s.SetAuthToken("secret")
+	if err := s.ListenAndServe(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		s.Shutdown(ctx)
+		s.Wait()
+	}()
+
+	conn, err := net.Dial("tcp", s.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	br := bufio.NewReader(conn)
+	for _, tc := range []struct {
+		command string
+		want    string
+	}{
+		{"*1\r\n$4\r\nPING\r\n", "-NOAUTH Authentication required.\r\n"},
+		{"*2\r\n$4\r\nAUTH\r\n$5\r\nwrong\r\n", "-WRONGPASS invalid username-password pair or user is disabled.\r\n"},
+		{"*2\r\n$4\r\nAUTH\r\n$6\r\nsecret\r\n", "+OK\r\n"},
+		{"*1\r\n$4\r\nPING\r\n", "+PONG\r\n"},
+	} {
+		if _, err := conn.Write([]byte(tc.command)); err != nil {
+			t.Fatal(err)
+		}
+		got, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != tc.want {
+			t.Fatalf("expected %q, got %q", tc.want, got)
+		}
+	}
+}
+
+func TestDelDoesNotMutateWhenAnyKeyMoved(t *testing.T) {
+	s := New("127.0.0.1:0", "test-node")
+	s.Store().Set("local", "value")
+	s.Ring().RemoveNode("test-node")
+	s.Ring().AddNode("remote", "10.0.0.1:6379", 256)
+	if err := s.ListenAndServe(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		s.Shutdown(ctx)
+		s.Wait()
+	}()
+
+	resp := dialResp(t, s.Addr(), "*3\r\n$3\r\nDEL\r\n$5\r\nlocal\r\n$6\r\nabsent\r\n")
+	if !strings.HasPrefix(resp, "-MOVED ") {
+		t.Fatalf("expected MOVED error, got %q", resp)
+	}
+	if s.Store().Len() != 1 {
+		t.Fatalf("expected store unchanged, got %d keys", s.Store().Len())
 	}
 }
 
@@ -390,4 +479,20 @@ func TestClusterSlotsWrongArity(t *testing.T) {
 	if !strings.HasPrefix(resp, "-ERR wrong number of arguments") {
 		t.Fatalf("expected arity error, got %q", resp)
 	}
+}
+
+func TestShutdownIdempotent(t *testing.T) {
+	s := New("127.0.0.1:0", "shutdown-node")
+	if err := s.ListenAndServe(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := s.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	s.Wait()
 }

@@ -9,6 +9,13 @@ import (
 	"strings"
 )
 
+const (
+	maxBulkStringLength = 64 << 20
+	maxArrayLength      = 1 << 20
+	maxLineLength       = 64 << 10
+	maxArrayDepth       = 32
+)
+
 // Reader reads RESP-encoded values from an io.Reader.
 type Reader struct {
 	br *bufio.Reader
@@ -21,6 +28,10 @@ func NewReader(r io.Reader) *Reader {
 
 // ReadValue reads one complete RESP value from the stream.
 func (rd *Reader) ReadValue() (Value, error) {
+	return rd.readValue(0)
+}
+
+func (rd *Reader) readValue(depth int) (Value, error) {
 	b, err := rd.br.ReadByte()
 	if err != nil {
 		return nil, err
@@ -35,30 +46,42 @@ func (rd *Reader) ReadValue() (Value, error) {
 	case '$':
 		return rd.readBulkString()
 	case '*':
-		arr, err := rd.readArray()
+		if depth >= maxArrayDepth {
+			return nil, fmt.Errorf("resp: array nesting exceeds %d", maxArrayDepth)
+		}
+		arr, err := rd.readArray(depth + 1)
 		if err != nil {
 			return nil, err
 		}
 		if arr == nil {
-			return nil, nil // null array → nil interface
+			return nil, nil
 		}
 		return arr, nil
 	default:
-		// Inline command — put the byte back and parse as inline
 		rd.br.UnreadByte()
 		return rd.readInline()
 	}
 }
 
 func (rd *Reader) readLine() (string, error) {
-	s, err := rd.br.ReadString('\n')
-	if err != nil {
-		return "", err
+	var line []byte
+	for {
+		part, err := rd.br.ReadSlice('\n')
+		if len(line)+len(part) > maxLineLength {
+			return "", fmt.Errorf("resp: line exceeds %d bytes", maxLineLength)
+		}
+		line = append(line, part...)
+		if err == nil {
+			break
+		}
+		if err != bufio.ErrBufferFull {
+			return "", err
+		}
 	}
-	if len(s) < 2 || s[len(s)-2] != '\r' {
+	if len(line) < 2 || line[len(line)-2] != '\r' {
 		return "", errors.New("resp: missing CRLF terminator")
 	}
-	return s[:len(s)-2], nil
+	return string(line[:len(line)-2]), nil
 }
 
 func (rd *Reader) readSimpleString() (SimpleString, error) {
@@ -101,7 +124,12 @@ func (rd *Reader) readBulkString() (BulkString, error) {
 	if err != nil {
 		return NullBulkString(), fmt.Errorf("resp: invalid bulk string length %q: %w", s, err)
 	}
-
+	if n < 0 {
+		return NullBulkString(), fmt.Errorf("resp: invalid negative bulk string length %d", n)
+	}
+	if n > maxBulkStringLength {
+		return NullBulkString(), fmt.Errorf("resp: bulk string length %d exceeds %d", n, maxBulkStringLength)
+	}
 	buf := make([]byte, n)
 	_, err = io.ReadFull(rd.br, buf)
 	if err != nil {
@@ -129,21 +157,27 @@ func (rd *Reader) readBulkString() (BulkString, error) {
 	return BulkString{Data: buf}, nil
 }
 
-func (rd *Reader) readArray() (Array, error) {
+func (rd *Reader) readArray(depth int) (Array, error) {
 	s, err := rd.readLine()
 	if err != nil {
 		return nil, err
 	}
 	if s == "-1" {
-		return nil, nil // null array
+		return nil, nil
 	}
 	n, err := strconv.Atoi(s)
 	if err != nil {
 		return nil, fmt.Errorf("resp: invalid array length %q: %w", s, err)
 	}
+	if n < 0 {
+		return nil, fmt.Errorf("resp: invalid negative array length %d", n)
+	}
+	if n > maxArrayLength {
+		return nil, fmt.Errorf("resp: array length %d exceeds %d", n, maxArrayLength)
+	}
 	arr := make(Array, n)
-	for i := 0; i < n; i++ {
-		v, err := rd.ReadValue()
+	for i := range n {
+		v, err := rd.readValue(depth)
 		if err != nil {
 			return nil, fmt.Errorf("resp: array element %d: %w", i, err)
 		}

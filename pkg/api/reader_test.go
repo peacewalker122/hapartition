@@ -144,3 +144,42 @@ func TestReadInlineCommand(t *testing.T) {
 		t.Fatalf("expected [SET key value], got %v", parts)
 	}
 }
+
+func TestReadRejectsInvalidBulkLength(t *testing.T) {
+	r := NewReader(strings.NewReader("$-2\r\n"))
+	if _, err := r.ReadValue(); err == nil {
+		t.Fatal("expected negative bulk length error")
+	}
+}
+
+func TestReadRejectsOverLimitBulk(t *testing.T) {
+	r := NewReader(strings.NewReader("$67108865\r\n"))
+	if _, err := r.ReadValue(); err == nil {
+		t.Fatal("expected oversized bulk error")
+	}
+}
+
+func TestReadRejectsOverLimitArray(t *testing.T) {
+	r := NewReader(strings.NewReader("*1048577\r\n"))
+	if _, err := r.ReadValue(); err == nil {
+		t.Fatal("expected oversized array error")
+	}
+}
+
+func TestReadRejectsOverLimitLine(t *testing.T) {
+	r := NewReader(strings.NewReader("+" + strings.Repeat("x", 64<<10) + "\r\n"))
+	if _, err := r.ReadValue(); err == nil {
+		t.Fatal("expected oversized line error")
+	}
+}
+
+func TestReadArrayNestingLimit(t *testing.T) {
+	valid := strings.Repeat("*1\r\n", maxArrayDepth) + ":1\r\n"
+	if _, err := NewReader(strings.NewReader(valid)).ReadValue(); err != nil {
+		t.Fatalf("expected nesting depth %d to succeed, got %v", maxArrayDepth, err)
+	}
+	invalid := strings.Repeat("*1\r\n", maxArrayDepth+1) + ":1\r\n"
+	if _, err := NewReader(strings.NewReader(invalid)).ReadValue(); err == nil {
+		t.Fatalf("expected nesting depth %d to fail", maxArrayDepth+1)
+	}
+}
